@@ -38,6 +38,8 @@ chunked-prefill-size: 4096              # 1024 -> 4096, prefill 吞吐主提升
 schedule-policy: lpm
 max-mamba-cache-size: 24                # ~6x maxreq
 gdn-mtp-cache-mode: none                # T1: skip intermediate h-state caching, reconstruct after verify
+enable-linear-replayssm: true           # ReplaySSM: MTP verify 记录 recurrence 输入按 accepted prefix 重放，替代全量状态快照；bitwise 无损、verify 不降；MTP×prefix-cache×overlap 正确组合（上游 Day-0 博文）
+linear-replayssm-cache-len: 16          # ring-buffer 深度，默认档
 
 # --- Mamba / GDN (migrated from systemd 2026-09-07) ---
 mamba-ssm-dtype: bfloat16               # SM100+ linear-attn-decode-backend=flashinfer 硬依赖，缺失即启动 ValueError
@@ -78,7 +80,7 @@ stream-interval: 1
 watchdog-timeout: 1800
 
 # --- Chat Template (第三方 v22.5, 独立文件不碰原版) ---
-chat-template: /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4/chat_template_froggeric_v22.5.jinja
+chat-template: ${MODEL_DIR}/chat_template_froggeric_v22.5.jinja
 
 # --- Parsers ---
 reasoning-parser: qwen3
