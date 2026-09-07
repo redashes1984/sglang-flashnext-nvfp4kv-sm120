@@ -16,8 +16,8 @@
 | 上下文 | 512K（YaRN ×2） | **768K（YaRN ×3）** |
 | KV 池 @ 786432 tokens | 9.4 GB（fp8，装不下） | **~5.1 GB** |
 | 并发 | 4 | **6** |
-| 解码 C1 | ~200 tok/s | 122 tok/s（比 fp8 C1 低 34%） |
-| 解码 C6 聚合 | — | **409 tok/s** |
+| 解码 C1 | ~200 tok/s | 136 tok/s（定档配置，见下） |
+| 解码 C6 聚合 | — | **550–575 tok/s** |
 | Prefill | ~11K tok/s | ~11K tok/s |
 | MTP（NEXTN）steps | 3 | 2（实测校准得出，见下文） |
 | Radix 前缀复用 | 开 | **开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s** |
@@ -27,7 +27,7 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 ## 为什么要 nvfp4 KV
 
-fp4 KV 池把 KV 显存砍半（打包 e2m1 + 很小的分块 scale）。在 96 GB 卡上，这就是 conc 6 下 512K 和 768K 上下文的区别 —— 权重、~44 GB 的 PLE n-gram pinned 表、MTP 图把其他显存全吃光了。代价是单流解码 −34% 的回退（gather-dequant 每步多两次 Triton launch + 一次反量化 kernel）；并发场景下这个代价被摊薄，净收益是容量。
+fp4 KV 池把 KV 显存砍半（打包 e2m1 + 很小的分块 scale）。在 96 GB 卡上，这就是 conc 6 下 512K 和 768K 上下文的区别 —— 权重、~44 GB 的 PLE n-gram pinned 表、MTP 图把其他显存全吃光了。代价是单流解码的回退（gather-dequant 每步多两次 Triton launch + 一次反量化 kernel；早期 −34%，定档栈收窄到 ~−32%，绝对值 C1≈136）；并发场景下这个代价被摊薄，净收益是容量（C6 550–575 tok/s）。
 
 ## 目录结构
 
@@ -40,7 +40,7 @@ patches/
                              NCCL op 会惰性分配 512 MB，池子接近打满时直接 OOM
                              （grammar 请求触发）。现场根因定位。
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案（conc6 / 768K / MTP2 / mamba32 / radix ON）
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案（conc6 / 768K / MTP2 / mamba24 钉死 / radix ON / extra_buffer_lazy）
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案（conc4 / 512K / MTP3 / mamba24 / HiCache ON）
   systemd/                          4 个 unit：每方案 main + warmup（同端口、同模型名，
                                     互斥 —— 停一个才能起另一个）
@@ -89,7 +89,8 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 ## 约束与诚实声明
 
 - 单卡消费级 GPU + 44 GB pinned PLE 表：两方案互斥；冷启动约 4 分钟。
-- C1 解码比 fp8 低 34% 是当前 gather-dequant 方案的固有代价；上游原生 fp4 QSA 解码池（#37798）能消掉它。
+- 定档 nvfp4kv 栈（2026-09-08）：GDN flashinfer 双端、mamba 槽钉 24 + KV 池 851968、prefill CUDA graph 强制 full（max_bs 4096）、FR-Spec 自建 64K 热表（coverage 1.0）、MTP steps=2、`--mamba-radix-cache-strategy=extra_buffer_lazy`（别名参数只能走 CLI）、`speculative-attention-mode: decode`。热态：C1≈136 / C6≈550–575 / prefill≈10K tok/s / accept len≈2.0–2.3。
+- C1 解码仍略低于 fp8（gather-dequant 的固有代价，比早期 122 t/s 已收窄）；上游原生 fp4 QSA 解码池（#37798）能消掉它。
 - 实验 unit 用 `Restart=no` 是故意的 —— 崩溃保留现场，不循环重启。
 - 所有数字来自单张 RTX PRO 6000（96 GB）、sglang `0.5.19.dev6+g78c5024e` + 本地补丁。SM121/GB10 是另一个故事（参考 gabrielolympie 关于该架构长上下文静默腐坏的记录）。
 

@@ -1,14 +1,13 @@
 # SGLang dealignai Qwen3.8-Flash-Next — NVFP4 KV 方案 (nvfp4kv)
-# conc6 / 768K / nvfp4 KV / MTP steps=2 / mamba 32 / radix ON / HiCache OFF / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
+# conc6 / 768K / nvfp4 KV / MTP steps=2 / mamba 24 / radix ON / HiCache OFF / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
 #   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
-#   前置补丁：dspark QSA×fp4 (/etc/sglang-flashnext/apply_nvfp4_patches.py) + sampler #37962 (标记 dspark-37962)
+#   前置补丁：dspark QSA×fp4 (/opt/sglang-config/apply_nvfp4_patches.py) + sampler #37962 (标记 dspark-37962)
 #   HiCache 必 OFF：#36121 fp4 scale buffer 不进 host 传输 → 驱逐回载后静默腐坏
 #   radix ON 实测：同前缀 99.96% 命中、553K tok 驱逐压力后 needle 仍正确（scale 搬运路径无恙）
-#   mamba 32 = radix ON 入场费（~3 槽/req，峰值 usage 0.62）；若关 radix 可降回 16
+#   mamba 24 = radix ON 入场费（峰值 usage 0.62 ≈20 槽）+ 余量钉死；32 是未钉制的自动 sizing 结果，多余槽为死显存
 #   与 fp8kv 方案互斥（单 GPU + PLE pinned 44GB），同时只跑一个；本 unit 故意不 enable，防开机抢 GPU
-#   性能账本：C1≈122 t/s / C6≈409 t/s / accept len≈1.95 / free VRAM≈1.8GB
-# ⚠️ 部署时把本文件中 ${MODEL_DIR} 替换为你的 checkpoint 目录（YAML 内容不经 systemd 展开）
-
+#   性能账本(2026-09-08 终版 GDN=flashinfer双端 + mamba24/KV851968 + prefill CG=full + FR-Spec表cov1.0 + MTP steps2/draft3 + ABL=extra_buffer_lazy + SAM=decode, 可复现热态)：C1≈136 t/s / C6≈550-575 t/s / prefill≈10K t/s / accept len≈2.0-2.3 rate≈0.5-0.66 / mamba峰值≤12槽 / KV池851968;注:EAGLE×FP4下prefill批次部分走eager(#28386);换表重置prefix cache namespace需预热2-3轮;MTP校准steps2为甜点;ABL收益在并发(C6+38%),单流微亏(-3%);SAM=decode再补C1/C6各~2-4%,accept分布不变;mamba-radix-cache-strategy为别名键只能走CLI flag
+#   定档(2026-09-08): 基线备份=yaml .bak-gdnpre-20260907-223437 / unit .bak-specv2-20260908-000843; 回滚=cp 基线覆盖后 systemctl restart
 # --- Network ---
 host: 0.0.0.0
 port: 8000
@@ -23,13 +22,14 @@ kv-cache-dtype: nvfp4
 prefill-attention-backend: triton
 decode-attention-backend: trtllm_mha
 linear-attn-decode-backend: flashinfer
+linear-attn-prefill-backend: flashinfer   # GDN prefill -> FlashInferGDNKernel (对齐 pennyroyal; 自动解析在 SM120 走 SM100-only 判断会回落 triton)
 
 # --- Quantization ---
 quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 786432                  # 768K 单请求装得下（fp4 池 ~5.1GB，fp8 需 9.4GB）
+max-total-tokens: 851968                  # = ctx 786432 + 64K：mamba 槽池省出的显存转成 KV，多会话前缀驻留；单请求仍受 context-length 约束
 context-length: 786432                    # YaRN x3; override in json-model-override-args
 max-running-requests: 6
 max-prefill-tokens: 16384
@@ -37,7 +37,7 @@ chunked-prefill-size: 4096
 
 # --- Scheduler (QSA hybrid) ---
 schedule-policy: lpm
-max-mamba-cache-size: 32                  # radix ON: ~5 slots/req at conc6
+max-mamba-cache-size: 24                  # radix ON: measured peak usage 0.62 (~20 slots) + headroom; pennyroyal 同款钉法
 gdn-mtp-cache-mode: none
 
 # --- Mamba / GDN ---
@@ -49,6 +49,9 @@ cuda-graph-config:
   decode:
     bs: [1, 2, 4, 6]
     max_bs: 6
+  prefill:
+    backend: full          # 强制 full 捕获绕开 Breakable×multimodal 自动禁用；回滚 .bak-pcg-*
+    max_bs: 4096           # 对齐 chunked-prefill-size；默认 ~42 档，捕获开销 ~0.56GB / ~30s
 
 # --- Speculative decoding NEXTN ---
 speculative-algorithm: NEXTN
@@ -56,6 +59,8 @@ speculative-num-steps: 2
 speculative-eagle-topk: 1
 speculative-num-draft-tokens: 3
 speculative-draft-model-quantization: unquant
+speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA), 替代默认 prefill 路径
+speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec: 自建 65536 中文增强热表(coverage 1.0); map hash 进 cache namespace,自动隔离旧 prefix cache
 
 # --- RoPE YaRN x3 (768K) ---
 json-model-override-args:

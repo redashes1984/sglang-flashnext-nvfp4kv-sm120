@@ -16,8 +16,8 @@ Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpez
 | Context | 512K (YaRN ×2) | **768K (YaRN ×3)** |
 | KV pool @ 786432 tokens | 9.4 GB (fp8, cannot fit) | **~5.1 GB** |
 | Concurrency | 4 | **6** |
-| Decode C1 | ~200 tok/s | 122 tok/s (−34% vs fp8 C1) |
-| Decode C6 aggregate | — | **409 tok/s** |
+| Decode C1 | ~200 tok/s | 136 tok/s (finalized config, see below) |
+| Decode C6 aggregate | — | **550–575 tok/s** |
 | Prefill | ~11K tok/s | ~11K tok/s |
 | MTP (NEXTN) steps | 3 | 2 (calibrated, see below) |
 | Radix prefix reuse | on | **on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix** |
@@ -27,7 +27,7 @@ Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6
 
 ## Why nvfp4 KV
 
-The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is the difference between 512K and 768K context at conc 6 — the weights, the ~44 GB pinned PLE n-gram table and MTP graphs eat everything else. The −34% single-stream decode regression is the price (gather-dequant adds two Triton launches + one dequant kernel per step); at concurrency it amortizes to a net capacity win.
+The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is the difference between 512K and 768K context at conc 6 — the weights, the ~44 GB pinned PLE n-gram table and MTP graphs eat everything else. The single-stream decode tax is the price (gather-dequant adds two Triton launches + one dequant kernel per step) — early builds measured −34%, the finalized stack narrows it to ~−32% at a higher absolute bar (C1 ≈136); at concurrency it amortizes to a net capacity win (C6 550–575 tok/s).
 
 ## Contents
 
@@ -40,7 +40,7 @@ patches/
                              first NCCL op lazily allocates 512 MB → OOM on a full
                              pool (grammar requests only). Crash root-caused live.
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme (conc6 / 768K / MTP2 / mamba32 / radix ON)
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme (conc6 / 768K / MTP2 / mamba24 pinned / radix ON / extra_buffer_lazy)
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme (conc4 / 512K / MTP3 / mamba24 / HiCache ON)
   systemd/                          4 units: main + warmup per scheme (same port, same model name,
                                     mutually exclusive — stop one, start the other)
@@ -87,8 +87,9 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
+- Finalized nvfp4kv stack (2026-09-08): GDN flashinfer both prefill+decode, mamba slots pinned at 24 + KV pool 851968, prefill CUDA graph forced full (max_bs 4096), FR-Spec 64K token map rebuilt on own corpus (coverage 1.0), MTP steps=2, `--mamba-radix-cache-strategy=extra_buffer_lazy` (CLI-only, alias arg), `speculative-attention-mode: decode`. Hot-state: C1≈136 / C6≈550–575 / prefill≈10K tok/s / accept len≈2.0–2.3.
 - Single consumer GPU + 44 GB pinned PLE table: the two schemes are mutually exclusive; expect ~4 min cold start.
-- Decode −34% at C1 vs fp8 is inherent to the gather-dequant approach today; native fp4 QSA decode pools (upstream #37798) would remove it.
+- Decode at C1 still trails fp8 (gather-dequant is inherent to the approach today; the finalized stack closes most of the gap: 136 vs ~200 tok/s). Upstream native fp4 QSA decode pools (#37798) would remove it.
 - `Restart=no` on the experiment unit is deliberate — preserve the crash scene.
 - Numbers are from one RTX PRO 6000 (96 GB), sglang `0.5.19.dev6+g78c5024e` + local patches. SM121/GB10 is a different story (see gabrielolympie's notes on silent long-context corruption there).
 

@@ -10,17 +10,15 @@ Group=root
 WorkingDirectory=/root
 
 # 与现役 unit 同构；仅 config 路径不同。Restart=no: 试验崩溃保留现场不循环重启。
-ExecStart=/opt/sglang/bin/sglang serve \
-  --model-path ${MODEL_DIR} \
-  --config /etc/sglang-flashnext/dealignai-qwen4exp-nvfp4kv.yaml \
+ExecStart=/opt/sglang-env/bin/sglang serve \
+  --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
+  --config /opt/sglang-config/dealignai-qwen4exp-nvfp4kv.yaml \
   --ple-offload-embedding \
-  --mamba-radix-cache-strategy=extra_buffer
+  --mamba-radix-cache-strategy=extra_buffer_lazy
 
 Restart=no
 RestartSec=30
 
-# 改成你的模型目录（NVFP4 checkpoint + PLE n-gram 表所在）
-Environment=MODEL_DIR=/opt/models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4
 Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CUDA_HOME=/usr/local/cuda
 Environment=PYTHONUNBUFFERED=1
