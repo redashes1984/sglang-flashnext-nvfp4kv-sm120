@@ -6,8 +6,6 @@
 #   性能账本：C1≈200 t/s / accept len 2.08-2.50（warmup 后 late-load 0）
 #   与 nvfp4kv 方案互斥（单 GPU + PLE pinned 44GB），同时只跑一个；当前 disabled，作回滚方案保留
 #   unit 仅剩 YAML 合并器不支持的两项 CLI：--ple-offload-embedding / --mamba-radix-cache-strategy
-# ⚠️ 部署时把本文件中 ${MODEL_DIR} 替换为你的 checkpoint 目录（YAML 内容不经 systemd 展开）
-
 # --- Network ---
 host: 0.0.0.0
 port: 8000
@@ -73,7 +71,7 @@ stream-interval: 1
 watchdog-timeout: 1800
 
 # --- Chat Template (第三方 v22.5, 独立文件不碰原版) ---
-chat-template: ${MODEL_DIR}/chat_template_froggeric_v22.5.jinja
+chat-template: /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4/chat_template_froggeric_v22.5.jinja
 
 # --- Parsers ---
 reasoning-parser: qwen3

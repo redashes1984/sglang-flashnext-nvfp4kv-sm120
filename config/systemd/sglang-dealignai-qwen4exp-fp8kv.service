@@ -12,9 +12,9 @@ WorkingDirectory=/root
 # 启动参数全部在 YAML (2026-09-07 迁移完成); unit 仅剩 YAML 合并器不支持的两项:
 #   --ple-offload-embedding (BooleanOptionalAction) / --mamba-radix-cache-strategy
 #   (DeprecatedAliasStoreAction dest 污染, YAML 写规范名会被误判 unsupported)
-ExecStart=/opt/sglang/bin/sglang serve \
-  --model-path ${MODEL_DIR} \
-  --config /etc/sglang-flashnext/dealignai-qwen4exp-fp8kv.yaml \
+ExecStart=/opt/sglang-env/bin/sglang serve \
+  --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
+  --config /opt/sglang-config/dealignai-qwen4exp-fp8kv.yaml \
   --ple-offload-embedding \
   --mamba-radix-cache-strategy=extra_buffer
 
@@ -23,8 +23,6 @@ Restart=on-abnormal
 RestartSec=30
 
 # 环境变量
-# 改成你的模型目录（NVFP4 checkpoint + PLE n-gram 表所在）
-Environment=MODEL_DIR=/opt/models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4
 Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=CUDA_HOME=/usr/local/cuda
 Environment=PYTHONUNBUFFERED=1
