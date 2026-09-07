@@ -1,0 +1,17 @@
+--- a/python/sglang/srt/layers/sampler.py.bak-37962-20260907-034432	2026-09-06 01:59:37.000000000 +0800
++++ a/python/sglang/srt/layers/sampler.py	2026-09-07 03:44:32.513600544 +0800
+@@ -497,7 +497,13 @@
+     def _sync_token_ids_across_tp(
+         self, batch_next_token_ids: torch.Tensor, sampling_info: SamplingBatchInfo
+     ):
+-        if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
++        if (
++            (SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars)
++            # dspark-37962: skip sync for a one-rank TP group. The first NCCL
++            # op lazily allocates 512MB device memory, which OOMs on a
++            # full pool (grammar requests only). Upstream #37962.
++            and dist.get_world_size(self.tp_sync_group) > 1
++        ):
+             # For performance reasons, SGLang does not sync the final token IDs across TP ranks by default.
+             # This saves one all-reduce, but the correctness of this approach depends on the determinism of several operators:
+             # the last all-reduce, the last lm_head matmul, and all sampling kernels.

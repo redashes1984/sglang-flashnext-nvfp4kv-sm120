@@ -1,0 +1,90 @@
+# SGLang dealignai Qwen3.8-Flash-Next — NVFP4 KV 方案 (nvfp4kv)
+# conc6 / 768K / nvfp4 KV / MTP steps=2 / mamba 32 / radix ON / HiCache OFF / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
+#   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
+#   前置补丁：dspark QSA×fp4 (/etc/sglang-flashnext/apply_nvfp4_patches.py) + sampler #37962 (标记 dspark-37962)
+#   HiCache 必 OFF：#36121 fp4 scale buffer 不进 host 传输 → 驱逐回载后静默腐坏
+#   radix ON 实测：同前缀 99.96% 命中、553K tok 驱逐压力后 needle 仍正确（scale 搬运路径无恙）
+#   mamba 32 = radix ON 入场费（~3 槽/req，峰值 usage 0.62）；若关 radix 可降回 16
+#   与 fp8kv 方案互斥（单 GPU + PLE pinned 44GB），同时只跑一个；本 unit 故意不 enable，防开机抢 GPU
+#   性能账本：C1≈122 t/s / C6≈409 t/s / accept len≈1.95 / free VRAM≈1.8GB
+# ⚠️ 部署时把本文件中 ${MODEL_DIR} 替换为你的 checkpoint 目录（YAML 内容不经 systemd 展开）
+
+# --- Network ---
+host: 0.0.0.0
+port: 8000
+
+# --- Device & Parallelism ---
+device: cuda
+tensor-parallel-size: 1
+dtype: bfloat16
+kv-cache-dtype: nvfp4
+
+# --- Attention Backends (SM120 关键，与现役一致) ---
+prefill-attention-backend: triton
+decode-attention-backend: trtllm_mha
+linear-attn-decode-backend: flashinfer
+
+# --- Quantization ---
+quantization: modelopt_fp4
+
+# --- Memory ---
+mem-fraction-static: 0.96
+max-total-tokens: 786432                  # 768K 单请求装得下（fp4 池 ~5.1GB，fp8 需 9.4GB）
+context-length: 786432                    # YaRN x3; override in json-model-override-args
+max-running-requests: 6
+max-prefill-tokens: 16384
+chunked-prefill-size: 4096
+
+# --- Scheduler (QSA hybrid) ---
+schedule-policy: lpm
+max-mamba-cache-size: 32                  # radix ON: ~5 slots/req at conc6
+gdn-mtp-cache-mode: none
+
+# --- Mamba / GDN ---
+mamba-ssm-dtype: bfloat16
+mamba-track-interval: 64
+
+# --- CUDA Graph ---
+cuda-graph-config:
+  decode:
+    bs: [1, 2, 4, 6]
+    max_bs: 6
+
+# --- Speculative decoding NEXTN ---
+speculative-algorithm: NEXTN
+speculative-num-steps: 2
+speculative-eagle-topk: 1
+speculative-num-draft-tokens: 3
+speculative-draft-model-quantization: unquant
+
+# --- RoPE YaRN x3 (768K) ---
+json-model-override-args:
+  text_config:
+    rope_parameters:
+      mrope_interleaved: true
+      mrope_section: [11, 11, 10]
+      rope_type: yarn
+      rope_theta: 10000000
+      partial_rotary_factor: 0.25
+      factor: 3.0
+      original_max_position_embeddings: 262144
+
+# --- Streaming ---
+stream-interval: 1
+watchdog-timeout: 1800
+
+# --- Chat Template ---
+chat-template: ${MODEL_DIR}/chat_template_froggeric_v22.5.jinja
+
+# --- Parsers ---
+reasoning-parser: qwen3
+tool-call-parser: qwen3_coder
+
+# --- Misc ---
+sleep-on-idle: true
+served-model-name: Qwen3.8-Flash-Next-NVFP4
+
+# --- HiCache OFF (fp4 硬约束，见文件头) ---
+enable-hierarchical-cache: false
+
+enable-metrics: true

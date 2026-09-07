@@ -1,0 +1,93 @@
+# SGLang dealignai Qwen3.8-Flash-Next — FP8 KV 方案 (fp8kv)
+# conc4 / 512K / fp8 KV / MTP steps=3 / mamba 24 / radix ON / HiCache ON / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
+#   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
+#   HiCache L2：ratio 2.0 / page_first / kernel io / write_through（fp8 下安全，nvfp4 下禁用）
+#   ctx 524288 = YaRN x2；max-total-tokens 552960 pinned（池后留 ~6GB 给 fp8 copies + graphs）
+#   性能账本：C1≈200 t/s / accept len 2.08-2.50（warmup 后 late-load 0）
+#   与 nvfp4kv 方案互斥（单 GPU + PLE pinned 44GB），同时只跑一个；当前 disabled，作回滚方案保留
+#   unit 仅剩 YAML 合并器不支持的两项 CLI：--ple-offload-embedding / --mamba-radix-cache-strategy
+# ⚠️ 部署时把本文件中 ${MODEL_DIR} 替换为你的 checkpoint 目录（YAML 内容不经 systemd 展开）
+
+# --- Network ---
+host: 0.0.0.0
+port: 8000
+
+# --- Device & Parallelism ---
+device: cuda
+tensor-parallel-size: 1
+dtype: bfloat16
+kv-cache-dtype: fp8_e4m3
+
+# --- Attention Backends (SM120 关键) ---
+prefill-attention-backend: triton
+decode-attention-backend: trtllm_mha
+linear-attn-decode-backend: flashinfer   # GDN decode -> FlashInfer (state-pool bf16); prefill stays triton; rollback: .bak-gdn
+
+# --- Quantization ---
+quantization: modelopt_fp4
+
+# --- Memory ---
+mem-fraction-static: 0.96
+max-total-tokens: 552960                # pinned: leave ~6GB post-pool headroom for fp8 copies + graphs
+context-length: 524288                  # YaRN x2 (override 见 json-model-override-args)
+max-running-requests: 4
+max-prefill-tokens: 16384
+chunked-prefill-size: 4096              # 1024 -> 4096, prefill 吞吐主提升
+
+# --- Scheduler (QSA hybrid) ---
+schedule-policy: lpm
+max-mamba-cache-size: 24                # ~6x maxreq
+gdn-mtp-cache-mode: none                # T1: skip intermediate h-state caching, reconstruct after verify
+
+# --- Mamba / GDN (migrated from systemd 2026-09-07) ---
+mamba-ssm-dtype: bfloat16               # SM100+ linear-attn-decode-backend=flashinfer 硬依赖，缺失即启动 ValueError
+mamba-track-interval: 64
+
+# --- CUDA Graph (migrated; 等价替代 --cuda-graph-bs-decode 1 2 4 / --cuda-graph-max-bs-decode=4) ---
+cuda-graph-config:
+  decode:
+    bs: [1, 2, 4]
+    max_bs: 4
+
+# --- Speculative decoding NEXTN (migrated from systemd) ---
+speculative-algorithm: NEXTN
+speculative-num-steps: 3
+speculative-eagle-topk: 1
+speculative-num-draft-tokens: 4
+speculative-draft-model-quantization: unquant
+
+# --- RoPE YaRN x2 (migrated from systemd --json-model-override-args) ---
+json-model-override-args:
+  text_config:
+    rope_parameters:
+      mrope_interleaved: true
+      mrope_section: [11, 11, 10]
+      rope_type: yarn
+      rope_theta: 10000000
+      partial_rotary_factor: 0.25
+      factor: 2.0
+      original_max_position_embeddings: 262144
+
+# --- Streaming ---
+stream-interval: 1
+watchdog-timeout: 1800
+
+# --- Chat Template (第三方 v22.5, 独立文件不碰原版) ---
+chat-template: ${MODEL_DIR}/chat_template_froggeric_v22.5.jinja
+
+# --- Parsers ---
+reasoning-parser: qwen3
+tool-call-parser: qwen3_coder
+
+# --- Misc ---
+sleep-on-idle: true
+served-model-name: Qwen3.8-Flash-Next-NVFP4
+
+# --- HiCache L2 (pilot re-test 2026-09-06, unified radix tree) ---
+enable-hierarchical-cache: true
+hicache-ratio: 2.0
+hicache-mem-layout: page_first
+hicache-io-backend: kernel
+hicache-write-policy: write_through
+
+enable-metrics: true

@@ -1,0 +1,43 @@
+[Unit]
+Description=SGLang dealignai Qwen3.8-Flash-Next NVFP4-KV scheme (nvfp4kv, port 8000)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/root
+
+# 与现役 unit 同构；仅 config 路径不同。Restart=no: 试验崩溃保留现场不循环重启。
+ExecStart=/opt/sglang/bin/sglang serve \
+  --model-path ${MODEL_DIR} \
+  --config /etc/sglang-flashnext/dealignai-qwen4exp-nvfp4kv.yaml \
+  --ple-offload-embedding \
+  --mamba-radix-cache-strategy=extra_buffer
+
+Restart=no
+RestartSec=30
+
+# 改成你的模型目录（NVFP4 checkpoint + PLE n-gram 表所在）
+Environment=MODEL_DIR=/opt/models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4
+Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CUDA_HOME=/usr/local/cuda
+Environment=PYTHONUNBUFFERED=1
+Environment=CUDA_VISIBLE_DEVICES=0
+Environment=FLASHINFER_REWRITE_CUDA_ARCH=12.0
+Environment=FLASHINFER_USE_CUDA_GRAPHS=1
+Environment=SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+Environment=SGLANG_SM120_LOWM_FP8_WEIGHT=1
+Environment=SGLANG_SM120_LM_HEAD_FP8=1
+Environment=SGLANG_ENABLE_SM120_LOWM_BF16_GEMM=1
+
+LimitNOFILE=65536
+LimitNPROC=4096
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

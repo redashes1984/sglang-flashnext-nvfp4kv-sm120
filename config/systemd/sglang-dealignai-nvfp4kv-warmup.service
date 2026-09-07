@@ -1,0 +1,15 @@
+[Unit]
+Description=SGLang kernel warmup for nvfp4kv scheme (long-prefill set)
+Wants=sglang-dealignai-qwen4exp-nvfp4kv.service
+After=sglang-dealignai-qwen4exp-nvfp4kv.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/sglang/bin/python /etc/sglang-flashnext/warmup_qsa_nvfp4kv.py
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

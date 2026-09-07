@@ -1,0 +1,15 @@
+[Unit]
+Description=SGLang QSA/grammar kernel warmup (fp8kv scheme)
+Wants=sglang-dealignai-qwen4exp-fp8kv.service
+After=sglang-dealignai-qwen4exp-fp8kv.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/sglang/bin/python /etc/sglang-flashnext/warmup_qsa_fp8kv.py
+TimeoutStartSec=1500
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
