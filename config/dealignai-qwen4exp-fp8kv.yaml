@@ -38,8 +38,8 @@ chunked-prefill-size: 4096              # 1024 -> 4096, prefill 吞吐主提升
 schedule-policy: lpm
 max-mamba-cache-size: 24                # ~6x maxreq
 gdn-mtp-cache-mode: none                # T1: skip intermediate h-state caching, reconstruct after verify
-enable-linear-replayssm: true           # ReplaySSM: MTP verify 记录 recurrence 输入按 accepted prefix 重放，替代全量状态快照；bitwise 无损、verify 不降；MTP×prefix-cache×overlap 正确组合（上游 Day-0 博文）
-linear-replayssm-cache-len: 16          # ring-buffer 深度，默认档
+# ReplaySSM 已评估并放弃：上游校验 (server_args.py _handle_linear_replayssm) 要求
+# linear-attn-decode-backend=triton，与 flashinfer GDN decode 互斥；flashinfer 收益已定档，不换。
 
 # --- Mamba / GDN (migrated from systemd 2026-09-07) ---
 mamba-ssm-dtype: bfloat16               # SM100+ linear-attn-decode-backend=flashinfer 硬依赖，缺失即启动 ValueError
