@@ -66,6 +66,11 @@ config/
   systemd/                          units per scheme + warmups (same port, same model name,
                                     mutually exclusive — stop one, start the other)
 scripts/
+  frspec_map_64k.pt           FR-Spec speculative token-map artifact (65,536 IDs; sha256
+                              598b0dc4… matches the manifest; shipped so the tuned stack is reproducible)
+  frspec_map_64k.manifest.json  build provenance: tokenizer sha256, corpus file list with per-file
+                              sha256, coverage 1.0, size/base_count/special-ids
+  build_token_map.py            rebuild the map from corpus + model tokenizer
   warmup_qsa_nvfp4kv.py       closes the late-device-load OOM window (long prefill,
                               grammar bitmask, bs6 graph buckets) before real traffic
   warmup_qsa_fp8kv.py         fp8 variant (prefix-cache hit path)

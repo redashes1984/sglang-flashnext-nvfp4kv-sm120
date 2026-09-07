@@ -65,6 +65,11 @@ config/
                                     作为回滚锚点和调优前后对照证据保留。
   systemd/                          每方案 main + warmup（同端口、同模型名，互斥 —— 停一个才能起另一个）
 scripts/
+  frspec_map_64k.pt           FR-Spec 投机热表产物（65,536 IDs；sha256 598b0dc4… 与 manifest
+                              一致；随仓库分发，保证调优栈可复现）
+  frspec_map_64k.manifest.json  构建溯源：tokenizer sha256、语料文件清单（逐文件 sha256）、
+                              coverage 1.0、size/base_count/特殊 token 列表
+  build_token_map.py            从语料 + 模型 tokenizer 重建热表
   warmup_qsa_nvfp4kv.py       在真实流量前进场加载，关掉 late-device-load OOM 窗口
                               （长 prefill、grammar bitmask、bs6 图桶）
   warmup_qsa_fp8kv.py         fp8 变体（含前缀缓存命中路径）
