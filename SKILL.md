@@ -1,6 +1,6 @@
 ---
 name: deploy-qwen-flash-next-nvfp4kv-sm120
-description: Reproduce the nvfp4kv Qwen3.8-Flash-Next sglang deployment on a single RTX PRO 6000 (SM120), including the second-round tuned stack and baseline rollback.
+description: Reproduce both tuned Qwen3.8-Flash-Next sglang schemes on one RTX PRO 6000 (SM120) — nvfp4kv mainline plus fp8kv rollback, each with baseline snapshots.
 ---
 
 # Deploy Qwen3.8-Flash-Next with NVFP4 KV on one RTX PRO 6000 (SM120)
@@ -9,9 +9,9 @@ Self-contained recipe for any agent (or human) to stand up this exact stack, ver
 
 ## What this is
 
-Qwen3.8-Flash-Next is a 180B hybrid MoE (GDN linear attention + QSA sparse attention + native NEXTN MTP) whose official FP8 checkpoint weighs ~173 GB and needs multi-GPU. A quantized community checkpoint (~102 GB NVFP4 with BF16 PLE table, or the smaller FP8-PLE variant) fits one RTX PRO 6000 Blackwell 96 GB (SM120). This stack runs it with `nvfp4` KV cache + QSA on sglang `qwen4-main-squashed` builds, plus seven tuning changes that raise aggregate throughput ~36% at conc 6.
+Qwen3.8-Flash-Next is a 180B hybrid MoE (GDN linear attention + QSA sparse attention + native NEXTN MTP) whose official FP8 checkpoint weighs ~173 GB and needs multi-GPU. A quantized community checkpoint (~102 GB NVFP4 with BF16 PLE table, or the smaller FP8-PLE variant) fits one RTX PRO 6000 Blackwell 96 GB (SM120). This stack runs it with `nvfp4` KV cache + QSA on sglang `qwen4-main-squashed` builds, plus seven tuning changes that raise aggregate throughput ~36% at conc 6. The fp8kv rollback scheme carries the portable subset of the same tuning (§Switching below).
 
-Two recorded config versions ship here: `config/baseline/` (pre-tuning snapshot, rollback anchor) and the current tuned files in `config/`. fp8kv is the second scheme (different trade-off, see `config/README-notes` below).
+Each scheme ships tuned-plus-baseline: active files in `config/`, pre-tuning snapshots as same-suffix `.baseline.*` under `config/baseline/` (rollback anchors + before/after evidence). `nvfp4kv` is the current mainline; `fp8kv` is the tuned rollback scheme — see §Switching to the fp8 KV scheme.
 
 ## Prerequisites
 
@@ -52,7 +52,7 @@ Two recorded config versions ship here: `config/baseline/` (pre-tuning snapshot,
 ```bash
 python3 scripts/bench_gdn.py            # or your own harness: C1 latency sweep + C6 aggregate
 ```
-Reference hot-state numbers (same GPU, this sglang build): C1 ≈136 tok/s, C6 aggregate ≈550–575 tok/s, prefill ≈10K tok/s, accept len ≈2.0–2.3 @ rate ≈0.5–0.66, mamba peak usage ≤12 slots. Run twice — first pass warms caches. If your numbers are far off, check the seven tuning items (below) are all present.
+Reference hot-state numbers (same GPU, this sglang build): C1 ≈136 tok/s, C6 aggregate ≈550–575 tok/s, prefill ≈10K tok/s, accept len ≈2.0–2.3 @ rate ≈0.5–0.66, mamba peak usage ≤12 slots. Run twice — first pass warms caches. If your numbers are far off, check the seven tuning items (below) are all present. Reference hot-state for the fp8kv scheme instead: C1 ≈165 / C6 aggregate ≈355–365 tok/s (conc4, steps=3).
 
 ## Tuning items vs baseline (what changed, why, effect)
 
@@ -69,7 +69,7 @@ Baseline is expected to measure C1 ≈122 / C6 ≈409.
 
 ## Switching to the fp8 KV scheme
 
-Use it when you need maximum single-stream decode (~200 tok/s C1) and can live with 512K ctx / conc 4. Swap in `config/dealignai-qwen4exp-fp8kv.yaml` + matching unit. As of 2026-09-08 the fp8kv files carry the same portable tuning items as nvfp4kv (GDN dual-end flashinfer, prefill CG full, SAM=decode, FR-Spec map, extra_buffer_lazy CLI flag); they differ only where fp8 economics differ: steps=3, HiCache ON, conc4/512K. The two schemes are mutually exclusive on one GPU.
+Use it when single-stream decode matters most — post-port two-pass measurement puts fp8kv *ahead* of nvfp4kv at C1 (≈165 vs ≈136 tok/s), while nvfp4kv keeps the concurrency crown (C6 ≈550–575 vs ≈355–365). Economics: conc4 / YaRN×2 512K / HiCache ON. Swap in `config/dealignai-qwen4exp-fp8kv.yaml` + matching unit pair (main + warmup); rollback to its own pair in `config/baseline/`. As of 2026-09-08 the fp8kv files carry the portable tuning items of nvfp4kv (GDN dual-end flashinfer, prefill CG full, SAM=decode, FR-Spec map sharing the same `.pt`, extra_buffer_lazy CLI flag); they differ only where fp8 economics differ: steps kept 3 (fp8 accept-len 2.08–2.50 favors deeper chains), HiCache ON (safe under fp8, mandatory-off under nvfp4 per #36121), KV pool stays 552,960 (fp4's byte-halving headroom doesn't exist under fp8). The two schemes are mutually exclusive on one GPU — same port, same served-model-name, stop one then start the other.
 
 ## Pitfalls checklist
 

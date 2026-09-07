@@ -2,7 +2,7 @@
 
 [English](README.md) | **简体中文**
 
-**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上以 `--kv-cache-dtype nvfp4` 跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。本仓库以「二次调优版」nvfp4kv 栈为主线组织；调优前的基准快照一并保留，作为回滚锚点和前后对照证据。**
+**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，现役主线，二次调优版）与 `fp8kv`（`fp8_e4m3`，回滚方案，吸收了同一批调优中可移植的一半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
 
 上游 sglang 无法让 NVFP4 *KV cache* 与 Qwen 稀疏注意力（QSA）共存：Triton gather 路径拿到的是打包 fp4 缓冲区，直接死在 `KeyError: 'float4_e2m1fn_x2'`。本仓库给出可用的修复（移植自 [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) 的 MIT 补丁，并针对 dspark 的 SM121 环境根本走不到的 SM120 trtllm-gen 稀疏解码路径做了适配），外加整套调优经验：sampler OOM 修复（[#37962](https://github.com/sgl-project/sglang/issues/37962) 同类问题）、HiCache 硬性约束、fp4 KV 下的 radix cache 经济学、完整的投机解码 steps 校准。
 
@@ -16,12 +16,12 @@
 | 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | **768K（YaRN ×3）** |
 | KV 池 | 552,960 | 786,432 | **851,968**（mamba 槽省出的显存转成 KV，+64K） |
 | 并发 | 4 | 6 | **6** |
-| 解码 C1 | ~200 tok/s | ~122 tok/s | **≈136 tok/s** |
-| 解码 C6 聚合 | — | ~409 tok/s | **≈550–575 tok/s** |
+| 解码 C1 | ≈165 tok/s | ~122 tok/s | **≈136 tok/s** |
+| 解码 C6 聚合 | ≈355–365 tok/s | ~409 tok/s | **≈550–575 tok/s** |
 | Prefill | ~11K tok/s | ~10K tok/s | **≈10K tok/s** |
 | MTP（NEXTN）steps | 3 | 2 | **2**（实测校准，见下文） |
 | Radix 前缀复用 | 开 | 开 | **开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s** |
-| HiCache L2 | 开 | 关 | **关**（fp4 KV 硬约束，见约束一节） |
+| HiCache L2 | **开**（fp8 下安全） | 关 | **关**（fp4 KV 硬约束，见约束一节） |
 
 nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 needle 测试、驱逐后前缀重查正确性、grammar JSON ×6、工具调用、零 retract、零报错。accept len ≈2.0–2.3，accept rate ≈0.5–0.66。
 
@@ -41,6 +41,23 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 写进 unit 的操作性约束：`mamba-radix-cache-strategy` 和 `ple-offload-embedding` 是别名/BooleanOptionalAction 参数，YAML ConfigArgumentMerger 不认（`DeprecatedAliasStoreAction` 报错）—— 只能以 CLI flag 形式留在 systemd `ExecStart`，不进 YAML。
 
+## fp8kv 方案（回滚栈）
+
+fp8kv 不是原始旧配置 —— 2026-09-08 它吸收了 nvfp4kv 调优中可移植的一半，两方案同卡互换不丢通用收益。
+
+| 项 | fp8kv 状态 | 理由 |
+|---|---|---|
+| GDN flashinfer 双端 | 已移植 | 纯后端路由，与 KV 类型无关 |
+| prefill CUDA graph 强制 full | 已移植 | 同样绕开 eager 抖动（#28386 一类） |
+| SAM=decode | 已移植 | verify/draft 纯后端路由 |
+| FR-Spec 64K 热表 | 已移植，共用同一 `.pt` | 表按 tokenizer 建，与 KV 类型无关 |
+| extra_buffer_lazy（别名参数走 CLI） | 已移植 | 槽经济学相同 |
+| MTP steps | 保持 **3**（nvfp4kv 为 2） | fp8 accept-len 实测 2.08–2.50，深度链条仍有收益 |
+| KV 池 | 保持 **552,960** | nvfp4kv 的 +64K 靠 fp4 砍半 KV 字节换来，fp8 无等价余量 |
+| HiCache L2 | 保持 **开** | fp8 下正常工作；nvfp4kv 必须关（#36121） |
+
+移植后热态实测（两轮取数，取第二轮）：C1 ≈165 / C6 聚合 ≈355–365 tok/s。更早的单轮 ~200 C1 读数在移植后未复现，以两轮值为准。注意交叉点：fp8kv 现在 C1 反超 nvfp4kv（≈165 vs ≈136），但输在并发聚合吞吐和前缀缓存深度。单流延迟敏感选 fp8kv，网关型并发流量选 nvfp4kv。同端口、同 served-model-name，互换 = 停一个 unit 起另一个。回滚锚点：`config/baseline/` 里的 fp8kv 同名对。
+
 ## 为什么要 nvfp4 KV
 
 fp4 KV 池把 KV 显存砍半（打包 e2m1 + 很小的分块 scale）。在 96 GB 卡上，这就是 conc 6 下 512K 和 768K 上下文的区别 —— 权重、~44 GB 的 PLE n-gram pinned 表、MTP 图把其他显存全吃光了。gather-dequant 的单流代价是固有的（每步多两次 Triton launch + 一次反量化 kernel）；调优版把 C1 从 ~122 拉到 ≈136，并发场景净收益明显（C6 ≈550–575 tok/s）。
@@ -59,7 +76,7 @@ config/
   dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 二次调优版（现役）：conc6 / 768K / MTP2 /
                                     mamba24 钉死 / KV 池 851968 / prefill CG full / FR-Spec 热表 /
                                     SAM=decode / extra_buffer_lazy（别名参数只能走 CLI）
-  dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案（conc4 / 512K / MTP3 / mamba24 / HiCache ON；2026-09-08 移植调优项 1/3/4/5/6：GDN 双端 flashinfer、prefill CG-full、SAM=decode、FR-Spec 热表、ABL=lazy —— steps 保持 3，fp8 accept len 2.08-2.50 下深度投机仍是甜点）
+  dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案 · 调优后回滚栈（conc4 / 512K / MTP3 / mamba24 / HiCache ON；2026-09-08 移植可移植项：GDN 双端 flashinfer、prefill CG-full、SAM=decode、FR-Spec 热表、ABL=lazy —— steps 保持 3，fp8 accept-len 2.08–2.50 下深度投机仍是甜点）
   baseline/                         双方案调优前基准快照，作回滚锚点与前后对照证据：
                                     nvfp4kv —— mamba32 自动 sizing、KV 池 786432、无 FR-Spec 表、
                                              SAM 不设、extra_buffer。
@@ -111,13 +128,14 @@ curl -s localhost:8000/v1/models          # → Qwen3.8-Flash-Next-NVFP4
 curl -s localhost:8000/get_server_info | jq '.kv_cache_dtype, .disable_radix_cache'
 ```
 
-nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`（用 fp8kv 方案文件）后，本仓库所有补丁均为惰性。
+nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`（用 fp8kv 方案文件）后，本仓库所有补丁均为惰性。要跑 fp8kv 方案：停 nvfp4kv unit，起 fp8kv 同名 unit 对（main + warmup），预期值见 §fp8kv 方案一节。
 
 ## 约束与诚实声明
 
 - 定档调优栈（2026-09-08）：GDN flashinfer 双端、mamba 钉 24 + KV 池 851968、prefill CG 强制 full、FR-Spec 64K 热表（coverage 1.0）、NEXTN steps=2/draft=3/topk=1、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。热态：C1≈136 / C6≈550–575 / prefill≈10K / accept len≈2.0–2.3。回滚 = 用 `config/baseline/` 文件覆盖现役文件后重启 unit。
+- 定档 fp8kv 栈（同日）：可移植项已移植（见 §fp8kv 方案）、steps 保持 3、HiCache 开、conc4 / YaRN×2 512K / KV 池 552,960、FR-Spec 热表共用。热态：C1≈165 / C6≈355–365 / accept len≈2.08–2.50。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
 - 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4 分钟。unit 故意不 enable，避免开机抢 GPU。
-- C1 解码仍低于 fp8（~136 vs ~200 tok/s，gather-dequant 的固有代价）；上游原生 fp4 QSA 解码池（#37798）能消掉这个差距。
+- C1 解码仍低于 fp8（≈136 vs ≈165 tok/s，gather-dequant 的固有代价）；上游原生 fp4 QSA 解码池（#37798）能消掉这个差距。
 - 实验 unit 用 `Restart=no` 是故意的 —— 崩溃保留现场，不循环重启。
 - 所有数字来自单张 RTX PRO 6000（96 GB）、sglang `0.5.19.dev6+g78c5024e` + 本地补丁。SM121/GB10 是另一个故事（参考 gabrielolympie 关于该架构长上下文静默腐坏的记录）。
 - 更换 FR-Spec 热表会一次性重置 prefix cache namespace —— 换表后预热 2–3 轮再上真实流量。
