@@ -2,32 +2,48 @@
 
 English | **[简体中文](README_zh.md)**
 
-**Patches, dual-scheme deployment configs and MTP calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included.**
+**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. This repo is organized around the SECOND-ROUND TUNED nvfp4kv stack; the pre-tuning baseline is kept alongside as the rollback anchor and before/after evidence.**
 
 Upstream sglang could not run NVFP4 *KV cache* together with Qwen Sparse Attention (QSA): the Triton gather path receives packed fp4 buffers and dies on `KeyError: 'float4_e2m1fn_x2'`. This repo ships the working fix (a port of the [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) patch, MIT, adapted for the SM120 trtllm-gen sparse-decode path that dspark's SM121 build never reaches), plus everything we learned tuning the result: a sampler OOM fix ([#37962](https://github.com/sgl-project/sglang/issues/37962)-class), the HiCache hard constraint, radix-cache economics under fp4 KV, and a full speculative-decoding steps calibration.
 
 Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) and [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) — both fp8-KV; **this repo is the nvfp4-KV datapoint** they don't have.
 
-## Results
+## Results (second-round tuned stack)
 
-| | fp8kv scheme | **nvfp4kv scheme** |
-|---|---|---|
-| KV cache dtype | fp8_e4m3 | **nvfp4 (packed e2m1 + per-block scales)** |
-| Context | 512K (YaRN ×2) | **768K (YaRN ×3)** |
-| KV pool @ 786432 tokens | 9.4 GB (fp8, cannot fit) | **~5.1 GB** |
-| Concurrency | 4 | **6** |
-| Decode C1 | ~200 tok/s | 136 tok/s (finalized config, see below) |
-| Decode C6 aggregate | — | **550–575 tok/s** |
-| Prefill | ~11K tok/s | ~11K tok/s |
-| MTP (NEXTN) steps | 3 | 2 (calibrated, see below) |
-| Radix prefix reuse | on | **on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix** |
-| HiCache L2 | on | **must be OFF** (see Constraints) |
+| | fp8kv scheme | baseline nvfp4kv | **tuned nvfp4kv (current)** |
+|---|---|---|---|
+| KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | **nvfp4** |
+| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | **768K (YaRN ×3)** |
+| KV pool @ tuned | 552,960 | 786,432 | **851,968** (+64K from reclaimed mamba slots) |
+| Concurrency | 4 | 6 | **6** |
+| Decode C1 | ~200 tok/s | ~122 tok/s | **≈136 tok/s** |
+| Decode C6 aggregate | — | ~409 tok/s | **≈550–575 tok/s** |
+| Prefill | ~11K tok/s | ~10K tok/s | **≈10K tok/s** |
+| MTP (NEXTN) steps | 3 | 2 | **2** (calibrated, see below) |
+| Radix prefix reuse | on | on | **on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix** |
+| HiCache L2 | on | off | **off** (mandatory under fp4 KV, see Constraints) |
 
-Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6×107K concurrent pool pressure (645K/786K tokens), post-eviction prefix re-query correctness, grammar JSON ×6, tool calls, zero retractions, zero errors.
+Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6×107K concurrent pool pressure, post-eviction prefix re-query correctness, grammar JSON ×6, tool calls, zero retractions, zero errors. Accept-len ≈2.0–2.3, accept-rate ≈0.5–0.66.
+
+## What changed vs baseline, why, and what it bought
+
+The tuned version differs from the baseline snapshot (`config/baseline/`) on exactly seven points. Aggregate effect: **+11% C1 / +36% C6**; the tuning evidence lives in this table.
+
+| # | Change (baseline → tuned) | Why | Effect |
+|---|---|---|---|
+| 1 | GDN linear-attn backend: decode-only flashinfer → **flashinfer on both prefill+decode** | Auto-resolution on SM120 falls through an SM100-only check back to triton for prefill; pin explicitly to reach FlashInferGDNKernel | Faster GDN prefill; base for the later wins |
+| 2 | `max-mamba-cache-size`: 32 (auto-sized) → **pin at 24** | Measured peak radix usage 0.62 ≈ 20 slots with lazy eviction; surplus slots are dead VRAM. Pennyroyal-class pinning | Freed VRAM converted into KV pool (+64K → 851,968), more session prefixes resident; multi-session C6 capacity up |
+| 3 | `--mamba-radix-cache-strategy`: extra_buffer → **extra_buffer_lazy** | Completed-request states linger for prefix reuse but don't need eager extra slots; lazy cuts ~5 → ~4 slots/request | **C6 +38%** (the single biggest win); −3% C1, net positive at concurrency |
+| 4 | Prefill CUDA graph: auto → **forced full capture** (`cuda-graph-config.prefill.backend: full`, `max_bs: 4096`) | Breakable×multimodal auto-disable leaves prefill batches eager (#28386-class); forcing full capture avoids it. Capture cost ~0.56 GB / ~30 s one-time | Prefill stable ≈10K tok/s; no eager-path jitter |
+| 5 | `speculative-attention-mode`: unset (prefill path) → **decode** | Verify/draft batches are decode-shaped; routing them to trtllm_mha/XQA matches the real batch shape. Does NOT touch real prefill batches (stay on triton) | +2–4% on both C1 and C6; accept distribution unchanged |
+| 6 | FR-Spec speculative token map: none → **self-built 64K hot table** (`speculative-token-map: frspec_map_64k.pt`, coverage 1.0) | Draft acceptance improved by seeding from our own corpus (obsidian notes + skill files → 65,536 IDs); map hash enters the cache namespace so old prefixes are auto-isolated | accept len ≈2.0 → 2.0–2.3; caveat: one-time prefix-cache namespace reset after swapping the table (warm 2–3 rounds) |
+| 7 | MTP steps: 3 → **2** (with draft=3/topk=1) | steps=3's accept-rate gain doesn't pay for the linear dequant cost under fp4 KV; measured steps=3: C1 drops to ~133–135, accept rate noisy 0.29–0.62 | steps=2 is the sweet spot; carried into baseline too but re-verified here |
+
+Operational note baked into the units: `mamba-radix-cache-strategy` and `ple-offload-embedding` are alias/BooleanOptionalAction args that the YAML ConfigArgumentMerger rejects (`DeprecatedAliasStoreAction`) — they must stay as CLI flags in the systemd `ExecStart`, never in the YAML.
 
 ## Why nvfp4 KV
 
-The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is the difference between 512K and 768K context at conc 6 — the weights, the ~44 GB pinned PLE n-gram table and MTP graphs eat everything else. The single-stream decode tax is the price (gather-dequant adds two Triton launches + one dequant kernel per step) — early builds measured −34%, the finalized stack narrows it to ~−32% at a higher absolute bar (C1 ≈136); at concurrency it amortizes to a net capacity win (C6 550–575 tok/s).
+The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is the difference between 512K and 768K context at conc 6 — the weights, the ~44 GB pinned PLE n-gram table and MTP graphs eat everything else. The single-stream decode tax is inherent to gather-dequant (two Triton launches + one dequant kernel per step); the tuned stack lifts C1 from ~122 to ≈136, and at concurrency it's a clear net win (C6 ≈550–575 tok/s).
 
 ## Contents
 
@@ -65,7 +81,7 @@ docs/
 3. **Radix cache × fp4 KV is safe on current builds** — `_slot_move_pointer_buffers` already moves `k/v_scale_buffer` alongside the data. Verified with a 553K-token eviction-pressure probe: needles stay correct after forced eviction and re-hit.
 4. **TP=1 sampler OOM (fixed here).** With grammars enabled the sampler runs a cross-TP token sync even at world_size=1; the first NCCL op allocates 512 MB lazily — fatal when the pool is 99.3% full. One-line guard, upstream #37962.
 5. **MTP steps must be re-calibrated per KV dtype.** Under fp4 KV, steps=2 beats both 1 and 3 (dequant cost scales with verify tokens; steps=3's accept-rate gain doesn't pay for it). fp8-era "more steps is better" does not transfer.
-6. **Mamba slot economics flip with radix.** Radix OFF: ~1 slot/request (conc6 fits in 16). Radix ON: completed-request states linger for prefix reuse → ~3 slots/request, 32 needed. The two knobs are coupled.
+6. **Mamba slot economics flip with radix.** Radix OFF: ~1 slot/request (conc6 fits in 16). Radix ON: completed-request states linger for prefix reuse → ~3 slots/request; with extra_buffer_lazy that drops to ~4/request and 24 pinned slots suffice. The knobs are coupled — tune them together.
 7. **Late Triton device-loads are a real OOM class.** First-touch kernel specializations (GDN chunk prefill, sparse-GQA, xgrammar bitmask) allocate *after* the pool is full. Warm up every shape family before traffic; extreme shapes can still trigger new specializations — monitor `device-loaded` in the journal.
 
 ## Reproduce
@@ -92,12 +108,12 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
-- Finalized nvfp4kv stack (2026-09-08): GDN flashinfer both prefill+decode, mamba slots pinned at 24 + KV pool 851968, prefill CUDA graph forced full (max_bs 4096), FR-Spec 64K token map rebuilt on own corpus (coverage 1.0), MTP steps=2, `--mamba-radix-cache-strategy=extra_buffer_lazy` (CLI-only, alias arg), `speculative-attention-mode: decode`. Hot-state: C1≈136 / C6≈550–575 / prefill≈10K tok/s / accept len≈2.0–2.3.
-- **Two recorded nvfp4kv versions** (both in this repo, both Apache-2.0): baseline in `config/baseline/` (mamba32 auto-sized, KV pool 786432, extra_buffer, no FR-Spec/SAM/CG-full — hot-state C1≈122 / C6≈409), second-round tuned above (current, in `config/`). The gap between them is the tuning evidence: lazy slot strategy + pinned mamba cap + decode-path spec attention + rebuilt token map ≈ +11% C1 / +36% C6, at the cost of a one-time prefix-cache namespace reset after the token-map swap. Roll back by copying the baseline files over the current ones and restarting the unit.
-- Single consumer GPU + 44 GB pinned PLE table: the two schemes are mutually exclusive; expect ~4 min cold start.
-- Decode at C1 still trails fp8 (gather-dequant is inherent to the approach today; the finalized stack closes most of the gap: 136 vs ~200 tok/s). Upstream native fp4 QSA decode pools (#37798) would remove it.
+- Finalized tuned stack (2026-09-08): GDN flashinfer both ends, mamba pinned 24 + KV pool 851968, prefill CG forced full, FR-Spec 64K map (coverage 1.0), NEXTN steps=2/draft=3/topk=1, extra_buffer_lazy (CLI-only alias), SAM=decode. Hot-state: C1≈136 / C6≈550–575 / prefill≈10K / accept len≈2.0–2.3. Rollback: copy `config/baseline/` files over the current ones and restart the unit.
+- Single consumer GPU + 44 GB pinned PLE table: the nvfp4kv and fp8kv schemes are mutually exclusive; expect ~4 min cold start. The unit deliberately ships unenabled to avoid boot-time GPU contention.
+- Decode at C1 still trails fp8 (~136 vs ~200 tok/s — inherent to gather-dequant today). Upstream native fp4 QSA decode pools (#37798) would remove the gap.
 - `Restart=no` on the experiment unit is deliberate — preserve the crash scene.
 - Numbers are from one RTX PRO 6000 (96 GB), sglang `0.5.19.dev6+g78c5024e` + local patches. SM121/GB10 is a different story (see gabrielolympie's notes on silent long-context corruption there).
+- Swapping the FR-Spec token map resets the prefix-cache namespace once — warm 2–3 rounds after any table change.
 
 ## Credits
 
