@@ -40,9 +40,14 @@ patches/
                              first NCCL op lazily allocates 512 MB → OOM on a full
                              pool (grammar requests only). Crash root-caused live.
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme (conc6 / 768K / MTP2 / mamba24 pinned / radix ON / extra_buffer_lazy)
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — SECOND-ROUND TUNED (current): conc6 / 768K /
+                                    MTP2 / mamba24 pinned / KV pool 851968 / prefill CG full /
+                                    FR-Spec token map / SAM=decode / extra_buffer_lazy (CLI-only alias)
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme (conc4 / 512K / MTP3 / mamba24 / HiCache ON)
-  systemd/                          4 units: main + warmup per scheme (same port, same model name,
+  baseline/                         nvfp4kv BASELINE snapshot (pre second-round tuning): mamba32 auto-sized,
+                                    KV pool 786432, no FR-Spec map, SAM unset, extra_buffer. Kept as the
+                                    rollback point and the tuning before/after evidence.
+  systemd/                          units per scheme + warmups (same port, same model name,
                                     mutually exclusive — stop one, start the other)
 scripts/
   warmup_qsa_nvfp4kv.py       closes the late-device-load OOM window (long prefill,
@@ -88,6 +93,7 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 ## Constraints & honest caveats
 
 - Finalized nvfp4kv stack (2026-09-08): GDN flashinfer both prefill+decode, mamba slots pinned at 24 + KV pool 851968, prefill CUDA graph forced full (max_bs 4096), FR-Spec 64K token map rebuilt on own corpus (coverage 1.0), MTP steps=2, `--mamba-radix-cache-strategy=extra_buffer_lazy` (CLI-only, alias arg), `speculative-attention-mode: decode`. Hot-state: C1≈136 / C6≈550–575 / prefill≈10K tok/s / accept len≈2.0–2.3.
+- **Two recorded nvfp4kv versions** (both in this repo, both Apache-2.0): baseline in `config/baseline/` (mamba32 auto-sized, KV pool 786432, extra_buffer, no FR-Spec/SAM/CG-full — hot-state C1≈122 / C6≈409), second-round tuned above (current, in `config/`). The gap between them is the tuning evidence: lazy slot strategy + pinned mamba cap + decode-path spec attention + rebuilt token map ≈ +11% C1 / +36% C6, at the cost of a one-time prefix-cache namespace reset after the token-map swap. Roll back by copying the baseline files over the current ones and restarting the unit.
 - Single consumer GPU + 44 GB pinned PLE table: the two schemes are mutually exclusive; expect ~4 min cold start.
 - Decode at C1 still trails fp8 (gather-dequant is inherent to the approach today; the finalized stack closes most of the gap: 136 vs ~200 tok/s). Upstream native fp4 QSA decode pools (#37798) would remove it.
 - `Restart=no` on the experiment unit is deliberate — preserve the crash scene.

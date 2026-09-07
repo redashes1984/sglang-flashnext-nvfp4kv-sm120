@@ -40,10 +40,14 @@ patches/
                              NCCL op 会惰性分配 512 MB，池子接近打满时直接 OOM
                              （grammar 请求触发）。现场根因定位。
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案（conc6 / 768K / MTP2 / mamba24 钉死 / radix ON / extra_buffer_lazy）
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 二次调优版（现役）：conc6 / 768K / MTP2 /
+                                    mamba24 钉死 / KV 池 851968 / prefill CG full / FR-Spec 热表 /
+                                    SAM=decode / extra_buffer_lazy（别名参数只能走 CLI）
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案（conc4 / 512K / MTP3 / mamba24 / HiCache ON）
-  systemd/                          4 个 unit：每方案 main + warmup（同端口、同模型名，
-                                    互斥 —— 停一个才能起另一个）
+  baseline/                         nvfp4kv 基准版快照（二次调优之前）：mamba32 自动 sizing、
+                                    KV 池 786432、无 FR-Spec 表、SAM 不设、extra_buffer。
+                                    作为回滚锚点和调优前后对照证据保留。
+  systemd/                          每方案 main + warmup（同端口、同模型名，互斥 —— 停一个才能起另一个）
 scripts/
   warmup_qsa_nvfp4kv.py       在真实流量前进场加载，关掉 late-device-load OOM 窗口
                               （长 prefill、grammar bitmask、bs6 图桶）
@@ -90,6 +94,7 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 
 - 单卡消费级 GPU + 44 GB pinned PLE 表：两方案互斥；冷启动约 4 分钟。
 - 定档 nvfp4kv 栈（2026-09-08）：GDN flashinfer 双端、mamba 槽钉 24 + KV 池 851968、prefill CUDA graph 强制 full（max_bs 4096）、FR-Spec 自建 64K 热表（coverage 1.0）、MTP steps=2、`--mamba-radix-cache-strategy=extra_buffer_lazy`（别名参数只能走 CLI）、`speculative-attention-mode: decode`。热态：C1≈136 / C6≈550–575 / prefill≈10K tok/s / accept len≈2.0–2.3。
+- **nvfp4kv 双版本记录**（都在本仓库）：基准版在 `config/baseline/`（mamba32 自动 sizing、KV 池 786432、extra_buffer、无 FR-Spec/SAM/CG-full —— 热态 C1≈122 / C6≈409），二次调优版（现役）在上面。两者差值就是调优证据：lazy 槽策略 + mamba 钉上限 + decode 路径 spec attention + 重建热表 ≈ C1 +11% / C6 +36%，代价是换热表后 prefix cache namespace 一次性重置。回滚 = 用 baseline 文件覆盖现役文件后重启 unit。
 - C1 解码仍略低于 fp8（gather-dequant 的固有代价，比早期 122 t/s 已收窄）；上游原生 fp4 QSA 解码池（#37798）能消掉它。
 - 实验 unit 用 `Restart=no` 是故意的 —— 崩溃保留现场，不循环重启。
 - 所有数字来自单张 RTX PRO 6000（96 GB）、sglang `0.5.19.dev6+g78c5024e` + 本地补丁。SM121/GB10 是另一个故事（参考 gabrielolympie 关于该架构长上下文静默腐坏的记录）。
