@@ -59,7 +59,7 @@ config/
   dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 二次调优版（现役）：conc6 / 768K / MTP2 /
                                     mamba24 钉死 / KV 池 851968 / prefill CG full / FR-Spec 热表 /
                                     SAM=decode / extra_buffer_lazy（别名参数只能走 CLI）
-  dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案（conc4 / 512K / MTP3 / mamba24 / HiCache ON）
+  dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案（conc4 / 512K / MTP3 / mamba24 / HiCache ON；2026-09-08 移植调优项 1/3/4/5/6：GDN 双端 flashinfer、prefill CG-full、SAM=decode、FR-Spec 热表、ABL=lazy —— steps 保持 3，fp8 accept len 2.08-2.50 下深度投机仍是甜点）
   baseline/                         nvfp4kv 基准版快照（二次调优之前）：mamba32 自动 sizing、
                                     KV 池 786432、无 FR-Spec 表、SAM 不设、extra_buffer。
                                     作为回滚锚点和调优前后对照证据保留。

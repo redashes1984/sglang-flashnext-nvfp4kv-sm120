@@ -69,7 +69,7 @@ Baseline is expected to measure C1 ≈122 / C6 ≈409.
 
 ## Switching to the fp8 KV scheme
 
-Use it when you need maximum single-stream decode (~200 tok/s C1) and can live with 512K ctx / conc 4. Swap in `config/dealignai-qwen4exp-fp8kv.yaml` + matching unit (`extra_buffer` instead of lazy, HiCache ON, steps=3, SAM unset — see the fp8kv migration list in README). The two schemes are mutually exclusive on one GPU.
+Use it when you need maximum single-stream decode (~200 tok/s C1) and can live with 512K ctx / conc 4. Swap in `config/dealignai-qwen4exp-fp8kv.yaml` + matching unit. As of 2026-09-08 the fp8kv files carry the same portable tuning items as nvfp4kv (GDN dual-end flashinfer, prefill CG full, SAM=decode, FR-Spec map, extra_buffer_lazy CLI flag); they differ only where fp8 economics differ: steps=3, HiCache ON, conc4/512K. The two schemes are mutually exclusive on one GPU.
 
 ## Pitfalls checklist
 

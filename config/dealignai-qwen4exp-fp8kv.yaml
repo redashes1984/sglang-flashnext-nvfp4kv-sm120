@@ -1,5 +1,6 @@
 # SGLang dealignai Qwen3.8-Flash-Next — FP8 KV 方案 (fp8kv)
-# conc4 / 512K / fp8 KV / MTP steps=3 / mamba 24 / radix ON / HiCache ON / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
+# conc4 / 512K / fp8 KV / MTP steps=3 / mamba 24 / radix ON / HiCache ON / GDN=flashinfer双端 / prefill CG=full / SAM=decode / FR-Spec表 / ABL=lazy(CLI)
+#   2026-09-08 移植 nvfp4kv 调优项 1/3/4/5/6；steps 保持 3（fp8 accept len 实测 2.08-2.50 高于 nvfp4，深度投机在 fp8 批次形状下仍是甜点）
 #   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
 #   HiCache L2：ratio 2.0 / page_first / kernel io / write_through（fp8 下安全，nvfp4 下禁用）
 #   ctx 524288 = YaRN x2；max-total-tokens 552960 pinned（池后留 ~6GB 给 fp8 copies + graphs）
@@ -19,7 +20,8 @@ kv-cache-dtype: fp8_e4m3
 # --- Attention Backends (SM120 关键) ---
 prefill-attention-backend: triton
 decode-attention-backend: trtllm_mha
-linear-attn-decode-backend: flashinfer   # GDN decode -> FlashInfer (state-pool bf16); prefill stays triton; rollback: .bak-gdn
+linear-attn-decode-backend: flashinfer   # GDN decode -> FlashInfer (state-pool bf16)
+linear-attn-prefill-backend: flashinfer   # GDN prefill 同步切 FlashInferGDNKernel：SM120 自动解析走 SM100-only 判断会回落 triton，必须显式双端指定（nvfp4kv 同款，prefill ≈10K t/s 的主来源）
 
 # --- Quantization ---
 quantization: modelopt_fp4
@@ -46,6 +48,9 @@ cuda-graph-config:
   decode:
     bs: [1, 2, 4]
     max_bs: 4
+  prefill:
+    backend: full          # 强制 full 捕获绕开 Breakable×multimodal 自动禁用（nvfp4kv 同款，#28386）
+    max_bs: 4096           # 对齐 chunked-prefill-size；捕获开销 ~0.56GB / ~30s
 
 # --- Speculative decoding NEXTN (migrated from systemd) ---
 speculative-algorithm: NEXTN
@@ -53,6 +58,8 @@ speculative-num-steps: 3
 speculative-eagle-topk: 1
 speculative-num-draft-tokens: 4
 speculative-draft-model-quantization: unquant
+speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA)，不影响真实 prefill 批次（仍 triton）；C1/C6 各 +2-4%
+speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec 中文增强热表（与 nvfp4kv 共用同一份 .pt；map hash 进 cache namespace，换表后预热 2-3 轮）
 
 # --- RoPE YaRN x2 (migrated from systemd --json-model-override-args) ---
 json-model-override-args:

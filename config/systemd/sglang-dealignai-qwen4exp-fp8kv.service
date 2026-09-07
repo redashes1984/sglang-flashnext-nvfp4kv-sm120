@@ -16,7 +16,7 @@ ExecStart=/opt/sglang-env/bin/sglang serve \
   --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --config /opt/sglang-config/dealignai-qwen4exp-fp8kv.yaml \
   --ple-offload-embedding \
-  --mamba-radix-cache-strategy=extra_buffer
+  --mamba-radix-cache-strategy=extra_buffer_lazy
 
 
 Restart=on-abnormal

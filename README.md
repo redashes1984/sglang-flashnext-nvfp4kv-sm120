@@ -59,7 +59,7 @@ config/
   dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — SECOND-ROUND TUNED (current): conc6 / 768K /
                                     MTP2 / mamba24 pinned / KV pool 851968 / prefill CG full /
                                     FR-Spec token map / SAM=decode / extra_buffer_lazy (CLI-only alias)
-  dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme (conc4 / 512K / MTP3 / mamba24 / HiCache ON)
+  dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme (conc4 / 512K / MTP3 / mamba24 / HiCache ON; tuned items 1/3/4/5/6 ported 2026-09-08: GDN dual-end flashinfer, CG-full prefill, SAM=decode, FR-Spec map, ABL=lazy — steps kept 3, accept-len 2.08-2.50 favors depth under fp8 batch shapes)
   baseline/                         nvfp4kv BASELINE snapshot (pre second-round tuning): mamba32 auto-sized,
                                     KV pool 786432, no FR-Spec map, SAM unset, extra_buffer. Kept as the
                                     rollback point and the tuning before/after evidence.
