@@ -60,9 +60,11 @@ config/
                                     mamba24 钉死 / KV 池 851968 / prefill CG full / FR-Spec 热表 /
                                     SAM=decode / extra_buffer_lazy（别名参数只能走 CLI）
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案（conc4 / 512K / MTP3 / mamba24 / HiCache ON；2026-09-08 移植调优项 1/3/4/5/6：GDN 双端 flashinfer、prefill CG-full、SAM=decode、FR-Spec 热表、ABL=lazy —— steps 保持 3，fp8 accept len 2.08-2.50 下深度投机仍是甜点）
-  baseline/                         nvfp4kv 基准版快照（二次调优之前）：mamba32 自动 sizing、
-                                    KV 池 786432、无 FR-Spec 表、SAM 不设、extra_buffer。
-                                    作为回滚锚点和调优前后对照证据保留。
+  baseline/                         双方案调优前基准快照，作回滚锚点与前后对照证据：
+                                    nvfp4kv —— mamba32 自动 sizing、KV 池 786432、无 FR-Spec 表、
+                                             SAM 不设、extra_buffer。
+                                    fp8kv   —— 移植前状态（不含 2026-09-08 调优移植）：GDN prefill
+                                             仍 triton、无 CG-full、无 SAM、无 FR-Spec 表、extra_buffer 非 lazy。
   systemd/                          每方案 main + warmup（同端口、同模型名，互斥 —— 停一个才能起另一个）
 scripts/
   frspec_map_64k.pt           FR-Spec 投机热表产物（65,536 IDs；sha256 598b0dc4… 与 manifest
