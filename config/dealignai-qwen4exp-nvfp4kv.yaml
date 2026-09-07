@@ -1,5 +1,5 @@
 # SGLang dealignai Qwen3.8-Flash-Next — NVFP4 KV 方案 (nvfp4kv)
-# conc6 / 768K / nvfp4 KV / MTP steps=2 / mamba 24 / radix ON / HiCache OFF / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
+# conc6 / 1M / nvfp4 KV / MTP steps=2 / mamba 24 / radix ON / HiCache OFF / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
 #   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
 #   前置补丁：dspark QSA×fp4 (/opt/sglang-config/apply_nvfp4_patches.py) + sampler #37962 (标记 dspark-37962)
 #   HiCache 必 OFF：#36121 fp4 scale buffer 不进 host 传输 → 驱逐回载后静默腐坏
@@ -29,8 +29,8 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 851968                  # = ctx 786432 + 64K：mamba 槽池省出的显存转成 KV，多会话前缀驻留；单请求仍受 context-length 约束
-context-length: 786432                    # YaRN x3; override in json-model-override-args
+max-total-tokens: 851968                 # = ctx 1048576 + 32K：mamba 槽池省出的显存转成 KV，多会话前缀驻留；单请求仍受 context-length 约束
+context-length: 786432                   # YaRN x4; override in json-model-override-args
 max-running-requests: 6
 max-prefill-tokens: 16384
 chunked-prefill-size: 4096
@@ -71,7 +71,6 @@ json-model-override-args:
       rope_type: yarn
       rope_theta: 10000000
       partial_rotary_factor: 0.25
-      factor: 3.0
       original_max_position_embeddings: 262144
 
 # --- Streaming ---
@@ -79,7 +78,7 @@ stream-interval: 1
 watchdog-timeout: 1800
 
 # --- Chat Template ---
-chat-template: ${MODEL_DIR}/chat_template_froggeric_v22.5.jinja
+chat-template: /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4/chat_template_froggeric_v22.5.jinja
 
 # --- Parsers ---
 reasoning-parser: qwen3
