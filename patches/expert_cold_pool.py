@@ -119,6 +119,7 @@ def debug_on():
 
 _KEEP = None
 _KEEP_LOADED = False
+_LEAK_DUMPED = [0]  # v2.5b forensic budget (storage-referrer dumps, first 2 misses)
 _BIAS_CACHE = {}    # (layer, dtype) -> persistent bias column (len = full-E = 512)
 _REMAP_CACHE = {}   # layer -> persistent remap table (len = full-E)
 _DIRTY = False
@@ -449,6 +450,7 @@ def maybe_shrink_after_process(model):
         if ref is None or scale_ref is None or ref.dim() == 0:
             continue  # unquantized (draft) or unexpected layout — never shrink blind
         E = int(ref.shape[0])
+        del scale_ref  # v2.5: holding it across the param loop pins one GPU tensor
         if E <= 1:
             continue
         keep = km[int(layer_id)]
@@ -463,24 +465,70 @@ def maybe_shrink_after_process(model):
                 "extend the whitelist (design §3 R3 gate) before enabling"
             )
         dev = ref.device
-        # SNAPSHOT all originals BEFORE any replacement (alias objects appear under 2 names)
-        orig = {}
+        pool = LayerPool(layer_id, keep, cold_ids, slots, m, E)
+        keep_idx_cpu = torch.tensor(keep, dtype=torch.long)
+        cold_idx_cpu = torch.tensor(cold_ids, dtype=torch.long)
+        # v2.6e — v1's own mechanism, learned from expert_tier.py: it survived
+        # real load via replace_expert_tensor => `param.data = new` (layer.py:527)
+        # — the Parameter OBJECT stays, its storage is swapped. Any alias or
+        # closure holding the OBJECT (not the old storage) sees the new one
+        # automatically; the old GPU storage loses its last tensor ref instantly.
+        # Peak trick: point param.data at the CPU keep slice FIRST (frees the GPU
+        # storage with zero new GPU bytes), then copy back — never above the old
+        # allocation size. v2.5's register_parameter(None) route failed because a
+        # closure cell pinned the old *storage object* (LEAK-CAP: cell(STORAGE)).
+        phys = pool.phys
+        # v2.7 FLAT PINNED BUFFER — CT112 census proved the pin cost is 40.5GB
+        # for 24.2GB of data: CachingHostAllocator rounds every >=1MB request UP
+        # TO THE NEXT POWER OF 2 (292MB->512, 146->256, 36.5->64, 18.3->32 per
+        # layer across 4 params = 864MB pinned per 493MB real). One per-param
+        # pin_memory() per layer did that 384 times. Fix: gather cold rows into
+        # ONE exact-size uint8 buffer per layer, pin once (493MB->512MB bucket),
+        # hand out row views. pool.host[gid][name] keeps the SAME tensor-row
+        # interface, so _row_from_host / Phase B / tests are untouched.
+        # keep/cold are ARBITRARY subsets (profile order) — row slices MUST go
+        # through index_select with keep_idx/cold_idx, never cpu[k:] tails.
+        param_cpu = {}   # id(tensor) -> (name, full cpu copy)
+        seen_ids = set()
+        cold_bytes = 0
         for name in ALL_PARAMS:
             t = getattr(m, name, None)
-            if isinstance(t, torch.Tensor) and t.dim() > 0 and t.shape[0] == E:
-                orig[name] = t
-        pool = LayerPool(layer_id, keep, cold_ids, slots, m, E)
-        keep_idx = torch.tensor(keep, dtype=torch.long, device=dev)
-        cold_idx_cpu = torch.tensor(cold_ids, dtype=torch.long)
-        for name, t in orig.items():
-            cold_rows = t.detach().index_select(0, cold_idx_cpu.to(dev)).to("cpu").contiguous().pin_memory()
+            if not isinstance(t, torch.Tensor) or t.dim() == 0 or t.shape[0] != E:
+                continue  # absent / 0-d / already swapped through a shared object
+            if id(t) in seen_ids:
+                continue  # two names aliasing one Parameter: pin/copy it once
+            seen_ids.add(id(t))
+            cpu = t.detach().to("cpu")  # D2H before release; no GPU alloc
+            param_cpu[id(t)] = (name, t, cpu)
+            cold_bytes += (cpu[0].numel() * cpu.element_size()) * len(cold_ids)
+        buf = torch.empty(cold_bytes, dtype=torch.uint8)
+        off = 0
+        _cold_slices = {}
+        for tid, (name, t, cpu) in param_cpu.items():
+            cr = cpu.index_select(0, cold_idx_cpu)  # (cold_len, ...)
+            nb = cr.numel() * cr.element_size()
+            buf[off:off + nb].view(cr.dtype).reshape(cr.shape).copy_(cr)
+            _cold_slices[name] = (off, nb, cr.shape, cr.dtype)
+            off += nb
+            del cr
+        pbuf = buf.pin_memory()  # ONE power-of-2 bucket per layer (~512MB)
+        del buf
+        for name, (o, nb, shape, dt) in _cold_slices.items():
+            flat = pbuf[o:o + nb].view(dt).reshape(shape)
             for i, gid in enumerate(cold_ids):
-                pool.host.setdefault(gid, {})[name] = cold_rows[i]
-            new_t = torch.zeros((pool.phys,) + tuple(t.shape[1:]), dtype=t.dtype, device=dev)
-            new_t[: pool.keep_len] = t.index_select(0, keep_idx)
-            _replace_with_aliases(m, name, new_t)
-            del t
-        del orig
+                pool.host.setdefault(gid, {})[name] = flat[i]
+        # GPU swap: free old 512-row storage via param.data=cpu-view (v2.6e),
+        # rebuild phys-row tensor, H2D the keep rows.
+        for tid, (name, t, cpu) in param_cpu.items():
+            keep_cpu = cpu.index_select(0, keep_idx_cpu)
+            _sh = t.shape
+            t.data = keep_cpu  # GPU storage refcount -> 0 (if nothing pins it)
+            torch.cuda.empty_cache()
+            t.data = torch.empty((phys,) + tuple(_sh[1:]), dtype=t.dtype, device=dev)
+            t.data[: pool.keep_len].copy_(keep_cpu)  # H2D of the SMALL tensor
+            del keep_cpu
+        param_cpu.clear()
+        del param_cpu
         # num_local_experts metadata must agree with the physical pool
         m.num_local_experts = pool.phys
         build_tables(layer_id, keep, len(cold_ids), slots, E, dev)
