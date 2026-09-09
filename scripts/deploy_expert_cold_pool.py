@@ -7,7 +7,10 @@ Assumes expert_cold_pool.py sits next to layers/moe/ (this script can copy it).
 Three source hooks + one env block:
   1. layers/moe/topk.py   — bias gate at select_experts entry, stash+remap at exit
   2. model_executor/model_runner.py — after_forward_hook() at forward() tail
-  3. models/qwen4_exp.py  — maybe_shrink_after_process() at end of load_weights
+  3. model_executor/model_runner.py — maybe_shrink_after_process(model) in
+     load_model() right after the loader returns (strictly post-pwal; v1's
+     qwen4_exp end-of-load_weights point ran BEFORE pwal and was the
+     silent-corruption root-cause candidate)
   4. (optional, --unit) systemd env lines on the test unit
 
 Env contract:
@@ -166,21 +169,31 @@ sub_mr = [
 ]
 patch_file(MR, sub_mr, "model_runner")
 
-# ---------------- 3. qwen4_exp.py ----------------
-sub_model = [
+# ---------------- 3. model_runner.py (shrink AFTER loader returns => post-pwal) ----------------
+# v2.1 fix: shrink was originally hooked at end of qwen4_exp.load_weights, which
+# runs BEFORE DefaultModelLoader calls process_weights_after_loading -> host pool
+# would snapshot pre-pwal bytes (no swizzle/deinterleave/alphas) against post-pwal
+# GPU rows. Moved to model_runner.load_model right after `self.model = loaded.model`,
+# which is loader-agnostic (covers Default/Layered/QuantizedRL/ModelOpt paths).
+sub_mr2 = [
     (
-        "shrink-after-load",
-        """        expert_tier.setup_expert_tiers(self)
-        return loaded_params""",
-        f"""        expert_tier.setup_expert_tiers(self)
-        {MARK}: cold-pool shrink AFTER process_weights_after_loading (loader)
+        "shrink-after-model-load",
+        """        self.loader = loaded.loader
+        self.model = loaded.model
+""",
+        f"""        self.loader = loaded.loader
+        self.model = loaded.model
+        {MARK}: cold-pool shrink strictly AFTER process_weights_after_loading;
+        # draft workers never shrink (their unquant FusedMoE layer_id can
+        # collide with keep-mask keys)
         from sglang.srt.layers.moe import expert_cold_pool as _ecp
 
-        _ecp.maybe_shrink_after_process(self)
-        return loaded_params""",
+        if not self.is_draft_worker:
+            _ecp.maybe_shrink_after_process(self.model)
+""",
     ),
 ]
-patch_file(MODEL, sub_model, "qwen4_exp")
+patch_file(MR, sub_mr2, "model_runner-shrink")
 
 print("[done] cold-pool v2 hooks wired. Deploy expert_cold_pool.py to:")
 print(f"  {SRT}/layers/moe/expert_cold_pool.py")

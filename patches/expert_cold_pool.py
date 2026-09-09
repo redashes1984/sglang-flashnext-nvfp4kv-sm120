@@ -398,9 +398,15 @@ def _inventory_gate(module, E):
 
 
 def maybe_shrink_after_process(model):
-    """End-of-load_weights hook. Full pool exists until here; cold rows -> pinned host;
-    GPU tensors rebuilt as keep+slots; persistent tables built; runtime gating armed.
-    Idempotent and process-local (draft process without fp4 layers shrinks nothing)."""
+    """Shrink entry — MUST run AFTER process_weights_after_loading (v2.1 fix).
+    Hooked in model_runner.load_model right after the loader returns, which is
+    loader-agnostic and strictly post-pwal: host pool then snapshots the FINAL
+    runtime layout (deinterleaved w13, swizzled scales, derived g1_alphas).
+    The old qwen4_exp end-of-load_weights point ran pre-pwal and would have
+    staged pre-pwal bytes into post-pwal rows (v1's silent-corruption
+    candidate root cause). Full pool exists until here; cold rows -> pinned host;
+    GPU tensors rebuilt as keep+slots; persistent tables built; gating armed.
+    Idempotent and process-local (draft workers are guarded out at the hook)."""
     if _STATE["shrunk"] or not offload_requested():
         return
     km = _keep_mask()
