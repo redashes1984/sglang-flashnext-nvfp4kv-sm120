@@ -220,10 +220,12 @@ def _unmask(layer_id, gid, phys_row):
     tbl = _REMAP_CACHE.get(int(layer_id))
     if tbl is not None:
         tbl[gid] = phys_row
-    pool = _STATE["layers"].get(int(layer_id))
-    if pool is not None:
-        col = _BIAS_CACHE.get((int(layer_id), pool.bias_dtype))
-        if col is not None:
+    # v2.4 (clue B): update EVERY cached bias column of this layer, not just
+    # pool.bias_dtype — apply_keep_mask picks the column by RUNTIME logits dtype,
+    # a one-column update left the others permanently masking the staged gid.
+    lid = int(layer_id)
+    for (bl, _dt), col in _BIAS_CACHE.items():
+        if bl == lid:
             col[gid] = 0.0
 
 
@@ -231,11 +233,18 @@ def _mask(layer_id, gid):
     tbl = _REMAP_CACHE.get(int(layer_id))
     if tbl is not None:
         tbl[gid] = 0
-    pool = _STATE["layers"].get(int(layer_id))
-    if pool is not None:
-        col = _BIAS_CACHE.get((int(layer_id), pool.bias_dtype))
-        if col is not None:
-            col[gid] = torch.finfo(pool.bias_dtype).min
+    lid = int(layer_id)
+    for (bl, dt), col in _BIAS_CACHE.items():
+        if bl == lid:
+            col[gid] = torch.finfo(dt).min
+
+
+def _return_row(pool, row):
+    """v2.4 (clue A): a failed stage must give the row back. _pick_row already
+    popped it from free_rows (and LRU-evicted its old owner); without this the
+    row belongs to nobody — silent slot leak accumulating toward zero capacity."""
+    if row is not None and row not in pool.row_gid and row not in pool.free_rows:
+        pool.free_rows.append(row)
 
 
 # ------------------------------------------------------------------ topk integration
@@ -657,6 +666,8 @@ def after_forward_hook():
                 if _row_from_host(pool, gid, row):
                     st["staged"] += 1
                     staged_now += 1
+                else:
+                    _return_row(pool, row)  # v2.4: never leak the slot on failure
         if degrade_enabled():
             _phase_b(pool, flat)
     if staged_now and st["calls"] % 64 < 8:

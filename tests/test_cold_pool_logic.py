@@ -230,7 +230,42 @@ def test_weak_demand_rejected():
     ecp._STATE["stats"]["calls"] += 7
     ecp.after_forward_hook()
     added = set(pool.gid_row.keys()) - before
-    check(18 not in added or True, "weak-demand gid not force-staged (soft)")
+    # v2.4: was `check(18 not in added or True, ...)` — a tautology that could never
+    # fail (audit finding). Real assertion: weak demand must NOT stage gid 18.
+    check(18 not in added, f"weak-demand gid 18 must not be staged (added={sorted(added)})")
+
+
+def test_row_return_on_stage_failure():
+    print("[T6] v2.4 clue A: failed _row_from_host must return the row")
+    pool = ecp._STATE["layers"][0]
+    gid = int(pool.cold_ids_gpu[3].item())
+    row = ecp._pick_row(pool)
+    check(row is not None, "picked a row")
+    saved = pool.host.pop(gid)  # simulate missing host bytes -> _row_from_host fails
+    try:
+        ok = ecp._row_from_host(pool, gid, row)
+    finally:
+        pool.host[gid] = saved
+    check(ok is False, "stage fails as designed")
+    ecp._return_row(pool, row)
+    check(row in pool.free_rows, "failed row is back in free_rows (no silent slot leak)")
+    ecp._return_row(pool, row)
+    check(pool.free_rows.count(row) == 1, "double-return does not duplicate the row")
+
+
+def test_bias_dtype_sync_all_columns():
+    print("[T7] v2.4 clue B: unmask/mask updates EVERY cached bias dtype column")
+    lid = 0
+    gid = int(ecp._STATE["layers"][lid].cold_ids_gpu[5].item())
+    ecp.build_tables(lid, ecp._STATE["layers"][lid].keep, 12, 4, 32, "cpu")
+    cols = {dt: col for (bl, dt), col in ecp._BIAS_CACHE.items() if bl == lid}
+    check(len(cols) >= 2, f"multi-dtype columns cached ({list(cols)})")
+    ecp._unmask(lid, gid, 25)
+    for dt, col in cols.items():
+        check(float(col[gid]) == 0.0, f"unmask cleared gid in {dt} column")
+    ecp._mask(lid, gid)
+    for dt, col in cols.items():
+        check(float(col[gid]) == torch.finfo(dt).min, f"mask re-armed gid in {dt} column")
 
 
 def test_inventory_gate():
@@ -246,6 +281,8 @@ def main():
     test_remap_fn()
     test_stash_and_hook()
     test_weak_demand_rejected()
+    test_row_return_on_stage_failure()
+    test_bias_dtype_sync_all_columns()
     test_inventory_gate()
     print()
     if FAIL:
