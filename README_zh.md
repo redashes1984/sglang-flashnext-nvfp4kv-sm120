@@ -2,26 +2,27 @@
 
 [English](README.md) | **简体中文**
 
-**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，现役主线，二次调优版）与 `fp8kv`（`fp8_e4m3`，回滚方案，吸收了同一批调优中可移植的一半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
+**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，现役主线；线上实例跑的是第三轮 nvfp4kv-1m 试验态）与 `fp8kv`（`fp8_e4m3`，回滚方案，吸收了同一批调优中可移植的一半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
 
 上游 sglang 无法让 NVFP4 *KV cache* 与 Qwen 稀疏注意力（QSA）共存：Triton gather 路径拿到的是打包 fp4 缓冲区，直接死在 `KeyError: 'float4_e2m1fn_x2'`。本仓库给出可用的修复（移植自 [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) 的 MIT 补丁，并针对 dspark 的 SM121 环境根本走不到的 SM120 trtllm-gen 稀疏解码路径做了适配），外加整套调优经验：sampler OOM 修复（[#37962](https://github.com/sgl-project/sglang/issues/37962) 同类问题）、HiCache 硬性约束、fp4 KV 下的 radix cache 经济学、完整的投机解码 steps 校准。
 
 前作基础：[jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) 与 [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) —— 两家都是 fp8-KV；**本仓库补上的是他们没有的 nvfp4-KV 数据点**。
 
-## 成果（二次调优版栈）
+## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版）
 
-| | fp8kv 方案 | nvfp4kv 基准版 | **nvfp4kv 二次调优版（现役）** |
-|---|---|---|---|
-| KV cache 类型 | fp8_e4m3 | nvfp4（打包 e2m1 + 分块 scale） | **nvfp4** |
-| 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | **1M（YaRN ×4）** |
-| KV 池 | 552,960 | 786,432 | **1,179,648**（第三轮为 int8 ckpt 池腾资后） |
-| 并发 | 4 | 6 | **6** |
-| 解码 C1 | ≈165 tok/s | ~122 tok/s | **≈75–90 tok/s**（1M 下 spec OFF） |
-| 解码 C6 聚合 | ≈355–365 tok/s | ~409 tok/s | **≈72–91 tok/s** |
-| Prefill | ~11K tok/s | ~10K tok/s | **≈9.7K tok/s**（冷前缀；radix 命中更高） |
-| MTP（NEXTN）steps | 3 | 2 | **OFF**（1M 单卡下 steps≥1 即 OOM） |
-| Radix 前缀复用 | 开 | 开 | **开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s** |
-| HiCache L2 | **开**（fp8 下安全） | 关 | **关**（fp4 KV 硬约束，见约束一节） |
+| | fp8kv 方案 | nvfp4kv 基准版 | nvfp4kv 二次调优版 | **nvfp4kv-1m 试验版（第三轮，现役）** |
+|---|---|---|---|---|
+| KV cache 类型 | fp8_e4m3 | nvfp4（打包 e2m1 + 分块 scale） | nvfp4 | **nvfp4** |
+| 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | 768K（YaRN ×3） | **1M（YaRN ×4 显式）** |
+| KV 池 | 552,960 | 786,432 | 851,968（回收 mamba 槽 +64K） | **1,179,648**（为 int8 ckpt 池腾资 + 启动余量后） |
+| 并发 | 4 | 6 | 6 | **6** |
+| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | **≈75–90 tok/s**（热态） |
+| 解码 C6 聚合 | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | **≈72–91 tok/s** |
+| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | **≈9.7K tok/s**（冷前缀；radix 命中更高） |
+| MTP（NEXTN）steps | 3 | 2 | 2（校准甜点） | **OFF**（1M 单卡下 steps≥1 即 OOM） |
+| Int8 mamba ckpt 池 | — | — | — | **开**（补丁 0002 × PLE 镜像，PR #38619） |
+| Radix 前缀复用 | 开 | 开 | 开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s | **开** |
+| HiCache L2 | **开**（fp8 下安全） | 关 | 关 | **关**（fp4 KV 硬约束，见约束一节） |
 
 nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 needle 测试、驱逐后前缀重查正确性、grammar JSON ×6、工具调用、零 retract、零报错。accept len ≈2.0–2.3，accept rate ≈0.5–0.66。
 

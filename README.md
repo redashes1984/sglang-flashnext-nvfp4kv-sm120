@@ -2,26 +2,27 @@
 
 English | **[简体中文](README_zh.md)**
 
-**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. Both shipped schemes are fully tuned: `nvfp4kv` (`--kv-cache-dtype nvfp4`, current mainline, second-round tuned) and `fp8kv` (`fp8_e4m3`, the rollback scheme, carrying the portable half of the same tuning). Each keeps its pre-tuning baseline under `config/baseline/` as rollback anchor and before/after evidence.**
+**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. Both shipped schemes are fully tuned: `nvfp4kv` (`--kv-cache-dtype nvfp4`, current mainline; the live instance runs the round-3 nvfp4kv-1m trial state) and `fp8kv` (`fp8_e4m3`, the rollback scheme, carrying the portable half of the same tuning). Each keeps its pre-tuning baseline under `config/baseline/` as rollback anchor and before/after evidence.**
 
 Upstream sglang could not run NVFP4 *KV cache* together with Qwen Sparse Attention (QSA): the Triton gather path receives packed fp4 buffers and dies on `KeyError: 'float4_e2m1fn_x2'`. This repo ships the working fix (a port of the [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) patch, MIT, adapted for the SM120 trtllm-gen sparse-decode path that dspark's SM121 build never reaches), plus everything we learned tuning the result: a sampler OOM fix ([#37962](https://github.com/sgl-project/sglang/issues/37962)-class), the HiCache hard constraint, radix-cache economics under fp4 KV, and a full speculative-decoding steps calibration.
 
 Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) and [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) — both fp8-KV; **this repo is the nvfp4-KV datapoint** they don't have.
 
-## Results (second-round tuned stack)
+## Results (stack generations: baseline → round-2 tuned → nvfp4kv-1m trial)
 
-| | fp8kv scheme | baseline nvfp4kv | **tuned nvfp4kv (current)** |
-|---|---|---|---|
-| KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | **nvfp4** |
-| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | **1M (YaRN ×4)** |
-| KV pool @ tuned | 552,960 | 786,432 | **1,179,648** (after funding the int8 ckpt pool, round 3) |
-| Concurrency | 4 | 6 | **6** |
-| Decode C1 | ≈165 tok/s | ~122 tok/s | **≈75–90 tok/s** (spec-off at 1M) |
-| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | **≈72–91 tok/s** |
-| Prefill | ~11K tok/s | ~10K tok/s | **≈9.7K tok/s** fresh-prefix; higher on radix hits |
-| MTP (NEXTN) steps | 3 | 2 | **OFF** (steps≥1 OOMs at 1M on one GPU) |
-| Radix prefix reuse | on | on | **on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix** |
-| HiCache L2 | **on** (safe under fp8) | off | **off** (mandatory under fp4 KV, see Constraints) |
+| | fp8kv scheme | baseline nvfp4kv | tuned nvfp4kv (round 2) | **nvfp4kv-1m trial (round 3, live)** |
+|---|---|---|---|---|
+| KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | nvfp4 | **nvfp4** |
+| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | 768K (YaRN ×3) | **1M (YaRN ×4 explicit)** |
+| KV pool | 552,960 | 786,432 | 851,968 (+64K reclaimed mamba slots) | **1,179,648** (after funding int8 ckpt pool + boot headroom) |
+| Concurrency | 4 | 6 | 6 | **6** |
+| Decode C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | **≈75–90 tok/s** warm-state |
+| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | **≈72–91 tok/s** |
+| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | **≈9.7K tok/s** fresh-prefix; higher on radix hits |
+| MTP (NEXTN) steps | 3 | 2 | 2 (calibrated sweet spot) | **OFF** (steps≥1 OOMs at 1M on one GPU) |
+| Int8 mamba ckpt pool | — | — | — | **ON** (patch 0002 × PLE mirrors, PR #38619) |
+| Radix prefix reuse | on | on | on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix | **on** |
+| HiCache L2 | **on** (safe under fp8) | off | off | **off** (mandatory under fp4 KV, see Constraints) |
 
 Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6×107K concurrent pool pressure, post-eviction prefix re-query correctness, grammar JSON ×6, tool calls, zero retractions, zero errors. Accept-len ≈2.0–2.3, accept-rate ≈0.5–0.66.
 
