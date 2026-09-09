@@ -415,7 +415,16 @@ def _inventory_gate(module, E):
         if name in ALL_PARAMS:
             continue
         if name in ("w13_blockscale_swizzled", "w2_blockscale_swizzled"):
-            continue  # alias of w*_weight_scale (same object) — handled in replace
+            # v2.7 audit guard: safe ONLY while alias_or_bind_derived_param took
+            # the same-object path (true iff swizzle needs no M/K padding, which
+            # holds for this checkpoint: 1280x160 / rows%128==0, cols%4==0).
+            # If a future config lands on the copy_or_rebind fallback, the
+            # swizzled scale becomes a SEPARATE 512-row Parameter that staging
+            # never refreshes -> silent kernel corruption; refuse to arm instead.
+            src = getattr(module, name.replace("blockscale_swizzled", "weight_scale"), None)
+            if t is not src:
+                bad.append((name, tuple(t.shape), str(t.dtype) + " (unaliased swizzled scale)"))
+            continue
         bad.append((name, tuple(t.shape), str(t.dtype)))
     return bad
 
