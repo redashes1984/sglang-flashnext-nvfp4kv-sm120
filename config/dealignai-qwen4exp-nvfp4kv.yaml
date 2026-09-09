@@ -1,5 +1,5 @@
 # SGLang dealignai Qwen3.8-Flash-Next — NVFP4 KV 方案 (nvfp4kv)
-# conc6 / 1M / nvfp4 KV / MTP steps=2 / mamba 24 / radix ON / HiCache OFF / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
+# conc6 / 1M / nvfp4 KV / MTP OFF (1M 腾池, #1M-OFF 行为恢复锚点) / mamba 24 / radix ON / HiCache OFF / CG both eager (QSA spec-off 捕获守卫) / (prefill=triton)/(decode=trtllm_mha, GDN=flashinfer)
 #   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
 #   前置补丁：dspark QSA×fp4 (/opt/sglang-config/apply_nvfp4_patches.py) + sampler #37962 (标记 dspark-37962)
 #   HiCache 必 OFF：#36121 fp4 scale buffer 不进 host 传输 → 驱逐回载后静默腐坏
@@ -29,8 +29,8 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 851968                 # = ctx 1048576 + 32K：mamba 槽池省出的显存转成 KV，多会话前缀驻留；单请求仍受 context-length 约束
-context-length: 786432                   # YaRN x4; override in json-model-override-args
+max-total-tokens: 1441792                  # +393K：空闲约4GB转KV，支撑约4x350K混合驻留；锚点=bak-pool144-1
+context-length: 1048576                    # YaRN x4; override in json-model-override-args
 max-running-requests: 6
 max-prefill-tokens: 16384
 chunked-prefill-size: 4096
@@ -38,7 +38,7 @@ chunked-prefill-size: 4096
 # --- Scheduler (QSA hybrid) ---
 schedule-policy: lpm
 max-mamba-cache-size: 24                  # radix ON: measured peak usage 0.62 (~20 slots) + headroom; pennyroyal 同款钉法
-gdn-mtp-cache-mode: none
+#1M-OFF gdn-mtp-cache-mode: none
 
 # --- Mamba / GDN ---
 mamba-ssm-dtype: bfloat16
@@ -48,21 +48,20 @@ mamba-track-interval: 64
 cuda-graph-config:
   decode:
     bs: [1, 2, 4, 6]
-    max_bs: 6
+    max_bs: 6   # T1: 实测 spec-off decode 图到底崩不崩
   prefill:
-    backend: full          # 强制 full 捕获绕开 Breakable×multimodal 自动禁用；回滚 .bak-pcg-*
-    max_bs: 4096           # 对齐 chunked-prefill-size；默认 ~42 档，捕获开销 ~0.56GB / ~30s
+    backend: disabled      # 同上；fp8kv 1M 实验同款处置
 
 # --- Speculative decoding NEXTN ---
-speculative-algorithm: NEXTN
-speculative-num-steps: 2
-speculative-eagle-topk: 1
-speculative-num-draft-tokens: 3
-speculative-draft-model-quantization: unquant
-speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA), 替代默认 prefill 路径
-speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec: 自建 65536 中文增强热表(coverage 1.0); map hash 进 cache namespace,自动隔离旧 prefix cache
+#1M-OFF speculative-algorithm: NEXTN
+#1M-OFF speculative-num-steps: 2
+#1M-OFF speculative-eagle-topk: 1
+#1M-OFF speculative-num-draft-tokens: 3
+#1M-OFF speculative-draft-model-quantization: unquant
+#1M-OFF speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA), 替代默认 prefill 路径
+#1M-OFF speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec: 自建 65536 中文增强热表(coverage 1.0); map hash 进 cache namespace,自动隔离旧 prefix cache
 
-# --- RoPE YaRN x3 (768K) ---
+# --- RoPE YaRN x4 (1M) ---
 json-model-override-args:
   text_config:
     rope_parameters:
@@ -71,6 +70,7 @@ json-model-override-args:
       rope_type: yarn
       rope_theta: 10000000
       partial_rotary_factor: 0.25
+      factor: 4.0
       original_max_position_embeddings: 262144
 
 # --- Streaming ---

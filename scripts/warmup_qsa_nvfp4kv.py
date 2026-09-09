@@ -1,5 +1,5 @@
 #!/opt/sglang-env/bin/python
-"""Kernel warmup for the nvfp4kv scheme service (port 8000).
+"""Kernel warmup for the fp4kv experiment service (port 8000, radix OFF).
 
 Closes the late-device-load OOM window. Late-load set observed 2026-09-07 r2
 (first 200K-token request, free VRAM ~0.8GiB):
@@ -21,7 +21,7 @@ WORDS = ("alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo "
          "lima mike november oscar papa quebec romeo sierra tango uniform "
          "victor whiskey xray yankee zulu").split()
 
-def log(m): print(f"[warmup-nvfp4kv] {time.strftime('%H:%M:%S')} {m}", flush=True)
+def log(m): print(f"[warmup-fp4kv] {time.strftime('%H:%M:%S')} {m}", flush=True)
 
 def wait_ready(max_s=1500):
     t0 = time.time()
