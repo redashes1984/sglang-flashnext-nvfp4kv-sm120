@@ -113,3 +113,53 @@ in your monitoring.
   and `--mamba-radix-cache-strategy` must stay in the unit.
 - **served-model-name suffixes for experiments**: routing keys break silently.
   Distinguish instances by port, never by model name.
+
+## 8. Round 3 (2026-09-09): int8 mamba checkpoint × PLE side-states
+
+**Goal.** Free BF16 mamba checkpoint slots at 1M context. Upstream guard:
+`maybe_init_int8_mamba_checkpoint_pool` raises ValueError when PLE side-state
+pools (ShortConvPool / NGramPool) are enabled, because the int8 pool frees the
+BF16 active slot after donate while the PLE pools index rows by that slot →
+orphaned side states. No upstream issue/PR covered the combination (`gh search`
+zero hits at the time).
+
+**Patch (0002).** Mirror each enabled side-state pool's rows into ckpt-sized
+buffers (`ckpt_slots + 1`, exact bf16/int64 copies — quantization stays on the
+temporal state only); store/load carries mirrors; `clear()` keeps mirrors alive
+across flush; `estimate_mem_usage_bytes` counts `ple_extra_bytes`. Cost measured
+<10 MB/slot vs ~27 MB/slot temporal. Upstream PR: **sgl-project/sglang#38619**
+(commits: main fix → factory kwargs-leak TypeError fix → CPU test).
+
+**Enablement.** `PYTHONPATH=/opt/sglang-patch/sglang/python` overlay + CLI flag
+`--enable-int8-mamba-checkpoint` on ExecStart (both alias-safe patterns). Boot
+log: `int8 mamba checkpoint pool: 48 slots, 1.42GB (qdata 1.29 + scale 0.02 +
+conv 0.10 + ple 0.01); active mamba pool 24 slots`.
+
+**Memory accounting.** The ckpt pool is funded *outside* the token-accounting
+formula, so `max-total-tokens` steps down to keep boot headroom:
+1441792 → 1310720 → **1179648** (~3.2 GB avail at startup). At 1310720 the first
+soak died mid-run with a real `torch.OutOfMemoryError` in the GDN extend path
+(late-load JIT + 6-concurrency activations stacked on the ckpt pool) — a budget
+problem, not a patch bug; the −131K step fixed it.
+
+**Warmup gotcha.** After a main-service restart, `systemctl start` on the warmup
+oneshot can silently no-op if the unit already recorded `Finished`. Use
+`systemctl restart sglang-dealignai-nvfp4kv-warmup` and confirm
+`[warmup-fp4kv] warmup complete` in its journal before soaking.
+
+**Patch-tree hygiene.** `/opt/sglang-patch` is based on pinned baseline commit
+`78c5024e9`. Latest HEAD's `memory_pool.py` imports
+`set_mla_kv_buffer_dcp_sharded_triton`, absent from the baseline `utils.py` →
+ImportError on full boot. Re-apply 0002 on a clean checkout of the pinned commit;
+don't merge HEAD files into the overlay.
+
+**Soak (final stack).** `/tmp/stress_int8ple.py`, aiohttp, 6 workers: Phase A
+64 distinct prefixes ×3 passes (~20K–74K tok each) overflowing the 48-slot ckpt
+pool → evict → reload; Phase B 128 same-prefix replays through the int8+mirror
+path; Phase C 6×200K KV crunch. Result **326/326 ok, 0 fail**; latency
+p50=23.7s p95=45.4s max=135.7s; journal after cutoff: zero OOM, zero
+leak/invariant lines; VRAM steady 96.8 GB; `NRestarts=0`. Hot-state on the
+final pool: C1 ≈75–90 / C6 ≈72–91 / prefill ≈9.7K fresh-prefix (radix hits
+measure higher). CPU integration test: `scripts/test_ckpt_ple_patch.py`, 16
+checks incl. the factory path that caught the kwargs-leak regression.
+

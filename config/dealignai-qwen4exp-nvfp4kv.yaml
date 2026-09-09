@@ -29,7 +29,7 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 1310720                  # -131K：为 int8 ckpt 池(1.42GB)腾资，0.84GB 回流；启动 headroom 预期 ~2.1GB；锚点=bak-pool144-1 / bak-int8ple-fund
+max-total-tokens: 1179648                  # 1M+128K：int8 ckpt(1.42GB)+prefill 瞬时激活 实测6x74K并发OOM，再降131K换0.84GB headroom→~3.1GB
 context-length: 1048576                    # YaRN x4; override in json-model-override-args
 max-running-requests: 6
 max-prefill-tokens: 16384

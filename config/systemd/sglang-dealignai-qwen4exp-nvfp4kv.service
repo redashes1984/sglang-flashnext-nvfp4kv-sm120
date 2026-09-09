@@ -14,12 +14,14 @@ ExecStart=/opt/sglang-env/bin/sglang serve \
   --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --config /opt/sglang-config/dealignai-qwen4exp-nvfp4kv.yaml \
   --ple-offload-embedding \
-  --mamba-radix-cache-strategy=extra_buffer_lazy
+  --mamba-radix-cache-strategy=extra_buffer_lazy \
+  --enable-int8-mamba-checkpoint
 
 Restart=no
 RestartSec=30
 
 Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONPATH=/opt/sglang-patch/sglang/python
 Environment=CUDA_HOME=/usr/local/cuda
 Environment=PYTHONUNBUFFERED=1
 Environment=CUDA_VISIBLE_DEVICES=0

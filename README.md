@@ -13,13 +13,13 @@ Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpez
 | | fp8kv scheme | baseline nvfp4kv | **tuned nvfp4kv (current)** |
 |---|---|---|---|
 | KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | **nvfp4** |
-| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | **768K (YaRN ×3)** |
-| KV pool @ tuned | 552,960 | 786,432 | **851,968** (+64K from reclaimed mamba slots) |
+| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | **1M (YaRN ×4)** |
+| KV pool @ tuned | 552,960 | 786,432 | **1,179,648** (after funding the int8 ckpt pool, round 3) |
 | Concurrency | 4 | 6 | **6** |
-| Decode C1 | ≈165 tok/s | ~122 tok/s | **≈136 tok/s** |
-| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | **≈550–575 tok/s** |
-| Prefill | ~11K tok/s | ~10K tok/s | **≈10K tok/s** |
-| MTP (NEXTN) steps | 3 | 2 | **2** (calibrated, see below) |
+| Decode C1 | ≈165 tok/s | ~122 tok/s | **≈75–90 tok/s** (spec-off at 1M) |
+| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | **≈72–91 tok/s** |
+| Prefill | ~11K tok/s | ~10K tok/s | **≈9.7K tok/s** fresh-prefix; higher on radix hits |
+| MTP (NEXTN) steps | 3 | 2 | **OFF** (steps≥1 OOMs at 1M on one GPU) |
 | Radix prefix reuse | on | on | **on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix** |
 | HiCache L2 | **on** (safe under fp8) | off | **off** (mandatory under fp4 KV, see Constraints) |
 
@@ -41,6 +41,23 @@ The tuned version differs from the baseline snapshot (`config/baseline/`) on exa
 
 Operational note baked into the units: `mamba-radix-cache-strategy` and `ple-offload-embedding` are alias/BooleanOptionalAction args that the YAML ConfigArgumentMerger rejects (`DeprecatedAliasStoreAction`) — they must stay as CLI flags in the systemd `ExecStart`, never in the YAML.
 
+## Third round (2026-09-09): int8 mamba checkpoint × PLE side-states, enabled
+
+Context: with a 1M-context nvfp4 pool the mamba BF16 checkpoint slots are the next memory frontier. Upstream's `maybe_init_int8_mamba_checkpoint_pool` **refused** to coexist with Qwen4-Exp PLE side states (`raise ValueError` when `int8_ckpt_pool` and `ShortConvPool`/`NGramPool` are both active) — the int8 pool frees the BF16 active slot after donating its state, but the PLE pools index their rows by that slot, so donated checkpoints would orphan the side states. No upstream issue/PR covered this combination at the time (searched via `gh search`).
+
+What `patches/0002-mamba-ckpt-ple.diff` does instead of the guard:
+
+1. `MambaCheckpointPool.__init__` gains `ple_side_states` — builds one mirror buffer per enabled side-state pool (ShortConv → bf16 rows, NGram → int64 rows), slot-axis sized `ckpt_slots + 1`, exact copies (quantization stays on the temporal state only).
+2. `store_from_active` / `load_to_active` carry the mirror rows alongside temporal/conv state; `clear()` intentionally keeps mirrors alive across flush (same discipline as qdata).
+3. `estimate_mem_usage_bytes` gains `ple_extra_bytes`; overhead measured <10 MB/slot vs ~27 MB/slot for temporal.
+4. `memory_pool.py` replaces the ValueError with a real `ple_side_states=[...]` pass-through.
+
+Enablement on this machine: `PYTHONPATH=/opt/sglang-patch/sglang/python` overlay + `--enable-int8-mamba-checkpoint` appended to the unit's `ExecStart`. The ckpt pool (48 slots, 1.42 GB: qdata 1.29 + scale 0.02 + conv 0.10 + ple mirrors 0.01) is funded **outside** the token-accounting formula, so `max-total-tokens` came down 1441792 → 1310720 → **1179648** to keep ~3.2 GB boot headroom. First soak at pool=1310720 failed mid-run with a genuine `torch.OutOfMemoryError` in the GDN extend path (late-load JIT + 6-concurrency activations on top of the ckpt pool) — the second drop to 1179648 fixed it. Second gotcha: after restarting the main service, `systemctl start` on the warmup oneshot can silently no-op if the unit already recorded a `Finished` state — use `systemctl restart sglang-dealignai-nvfp4kv-warmup` and confirm `[warmup-fp4kv] warmup complete` in its journal.
+
+Soak result on the final stack (`scripts/test_ckpt_ple_patch.py` is the CPU integration test, T1–T6 incl. the factory path that caught a kwargs-leak TypeError; the service soak is `/tmp/stress_int8ple.py`): **326 requests / 326 ok / 0 fail** across Phase A (64 distinct prefixes ×3 passes, overflows the 48-slot ckpt pool → evict → reload), Phase B (same-prefix reload through int8 + PLE mirrors), Phase C (6×200K KV crunch). Latency p50=23.7s p95=45.4s max=135.7s, journal clean after cutoff (zero OOM, zero leak/invariant lines), VRAM steady 96.8 GB, `NRestarts=0`. Hot-state on this final pool: C1 ≈87 / C6 ≈91 / prefill ≈9.7K tok/s — slightly below the spec-on peaks, which is the price of the 1M pool. Submitted upstream as **sgl-project/sglang#38619**.
+
+Patch-tree hygiene note: `/opt/sglang-patch` is built on the pinned baseline commit `78c5024e9`, not latest HEAD — newer `memory_pool.py` imports `set_mla_kv_buffer_dcp_sharded_triton` which doesn't exist in the baseline's `utils.py`, breaking full service boot with an ImportError. Re-apply `0002` onto a fresh checkout of that commit, don't copy HEAD files in.
+
 ## The fp8kv scheme (rollback stack)
 
 fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable half of the nvfp4kv tuning, so the two schemes swap on one GPU without losing the generic wins.
@@ -56,11 +73,11 @@ fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable
 | KV pool | kept **552,960** | nvfp4kv's +64K is bought by fp4 halving KV bytes; fp8 has no equivalent headroom |
 | HiCache L2 | kept **ON** | Works under fp8; nvfp4kv requires it OFF (#36121) |
 
-Hot-state after the port (two-pass, second run): C1 ≈165 / C6 aggregate ≈355–365 tok/s. An earlier single-pass ~200 C1 reading did not reproduce post-port — trust the two-pass numbers. Note the crossover: fp8kv now beats nvfp4kv on C1 (≈165 vs ≈136) while losing on aggregate concurrency and prefix-cache depth. Pick fp8kv for latency-sensitive single-stream work; pick nvfp4kv for gateway-style concurrent traffic. Same port, same served-model-name — swapping = stop one unit, start the other. Rollback anchor: the fp8kv pair in `config/baseline/`.
+Hot-state after the port (two-pass, second run): fp8kv C1 ≈165 / C6 aggregate ≈355–365 tok/s. An earlier single-pass ~200 C1 reading did not reproduce post-port — trust the two-pass numbers. Note the crossover: fp8kv (spec-on 512K) beats nvfp4kv (spec-off 1M) on C1 (≈165 vs ≈75–90) while nvfp4kv buys 2× context capacity and eviction headroom for distinct long prefixes. Pick fp8kv for latency-sensitive single-stream work; pick nvfp4kv when context capacity matters. Same port, same served-model-name — swapping = stop one unit, start the other. Rollback anchor: the fp8kv pair in `config/baseline/`.
 
 ## Why nvfp4 KV
 
-The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is the difference between 512K and 768K context at conc 6 — the weights, the ~44 GB pinned PLE n-gram table and MTP graphs eat everything else. The single-stream decode tax is inherent to gather-dequant (two Triton launches + one dequant kernel per step); the tuned stack lifts C1 from ~122 to ≈136, and at concurrency it's a clear net win (C6 ≈550–575 tok/s).
+The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is what makes 1M context at conc 6 possible at all — the weights, the ~44 GB pinned PLE n-gram table and the CUDA graphs eat everything else. The single-stream decode tax is inherent to gather-dequant (two Triton launches + one dequant kernel per step); with spec-off at 1M the hot state sits at C1 ≈75–90 tok/s, and the round-3 int8 checkpoint pool adds eviction headroom for many distinct long prefixes. Pick fp8kv (512K, spec-on) when raw decode speed matters; pick nvfp4kv when context capacity matters.
 
 ## Contents
 
@@ -72,10 +89,14 @@ patches/
                              TP=1 sampler fix: skip the cross-TP token sync whose
                              first NCCL op lazily allocates 512 MB → OOM on a full
                              pool (grammar requests only). Crash root-caused live.
+  0002-mamba-ckpt-ple.diff   int8 mamba checkpoint pool mirrors PLE side states
+                             (short-conv bf16 / ngram int64 rows) instead of the
+                             upstream ValueError guard. Upstream PR #38619.
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — SECOND-ROUND TUNED (current): conc6 / 768K /
-                                    MTP2 / mamba24 pinned / KV pool 851968 / prefill CG full /
-                                    FR-Spec token map / SAM=decode / extra_buffer_lazy (CLI-only alias)
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — THIRD ROUND (current): conc6 / 1M /
+                                    spec OFF / mamba24 pinned / KV pool 1179648 / int8 mamba
+                                    checkpoint ON (PLE mirrors, patch 0002) / decode CG
+                                    bs[1,2,4,6] / prefill CG disabled under spec-off
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme — tuned rollback stack (conc4 / 512K / MTP3 / mamba24 / HiCache ON; portable items ported 2026-09-08: GDN dual-end flashinfer, CG-full prefill, SAM=decode, FR-Spec map, ABL=lazy — steps kept 3, accept-len 2.08-2.50 favors depth under fp8 batch shapes)
   baseline/                         Pre-tuning BASELINE snapshots for BOTH schemes, kept as
                                     rollback points and before/after evidence:
@@ -87,6 +108,8 @@ config/
   systemd/                          units per scheme + warmups (same port, same model name,
                                     mutually exclusive — stop one, start the other)
 scripts/
+  test_ckpt_ple_patch.py     CPU integration test T1–T6 for patch 0002 (mirror
+                             roundtrip, dtype fidelity, factory-path kwargs check)
   frspec_map_64k.pt           FR-Spec speculative token-map artifact (65,536 IDs; sha256
                               598b0dc4… matches the manifest; shipped so the tuned stack is reproducible)
   frspec_map_64k.manifest.json  build provenance: tokenizer sha256, corpus file list with per-file
@@ -134,10 +157,10 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
-- Finalized tuned stack (2026-09-08): GDN flashinfer both ends, mamba pinned 24 + KV pool 851968, prefill CG forced full, FR-Spec 64K map (coverage 1.0), NEXTN steps=2/draft=3/topk=1, extra_buffer_lazy (CLI-only alias), SAM=decode. Hot-state: C1≈136 / C6≈550–575 / prefill≈10K / accept len≈2.0–2.3. Rollback: copy `config/baseline/` files over the current ones and restart the unit.
+- Finalized tuned stack (2026-09-08 second round, superseded on the memory knobs by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. Hot-state after round 3: C1 ≈75–90 / C6 ≈72–91 / prefill ≈9.7K fresh-prefix. Rollback: copy `config/baseline/` files over the current ones and restart the unit.
 - Finalized fp8kv stack (same date): portable items ported (§The fp8kv scheme), steps kept 3, HiCache ON, conc4 / YaRN×2 512K / KV pool 552,960, FR-Spec map shared. Hot-state: C1≈165 / C6≈355–365 / accept len≈2.08–2.50. Rollback = its own `config/baseline/` pair over the current files.
 - Single consumer GPU + 44 GB pinned PLE table: the nvfp4kv and fp8kv schemes are mutually exclusive; expect ~4 min cold start. The unit deliberately ships unenabled to avoid boot-time GPU contention.
-- Decode at C1 still trails fp8 (~136 vs ~165 tok/s post-port — inherent to gather-dequant today). Upstream native fp4 QSA decode pools (#37798) would remove the gap.
+- Decode at C1 still trails fp8 (~75–90 vs ≈165 tok/s at 1M spec-off — inherent to gather-dequant today, plus the spec-off tax at 1M). Upstream native fp4 QSA decode pools (#37798) would remove the gap.
 - `Restart=no` on the experiment unit is deliberate — preserve the crash scene.
 - Numbers are from one RTX PRO 6000 (96 GB), sglang `0.5.19.dev6+g78c5024e` + local patches. SM121/GB10 is a different story (see gabrielolympie's notes on silent long-context corruption there).
 - Swapping the FR-Spec token map resets the prefix-cache namespace once — warm 2–3 rounds after any table change.
