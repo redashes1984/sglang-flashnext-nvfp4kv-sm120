@@ -160,6 +160,16 @@ def test_remap_fn():
     check(torch.equal(low.flatten(), torch.arange(10, dtype=torch.int32)), "packed low bits untouched")
     hi = (p2 >> 16) & 0xFFFF
     check(hi.flatten().tolist() == [0, 5, 0, 0, 1, 2, 3, 4, 6, 7], f"packed ids remapped (25,31->masked row0): {hi.flatten().tolist()}")
+    # --- v2.2: id=-1 padding rows (_mask_topk_ids_padded_region fill_value=-1)
+    ids_neg = torch.tensor([[0, -1, 5, -1, 31]])
+    out_neg = ecp.remap_topk_ids(0, ids_neg)
+    check(out_neg[0, 1] == -1 and out_neg[0, 3] == -1,
+          f"topk remap keeps -1 verbatim (no silent tbl[-1] map): {out_neg[0].tolist()}")
+    check(int(out_neg[0, 4]) == 0, "staged/unstaged cold still maps to row0")
+    packed_neg = (ids_neg.to(torch.int32) << 16) | torch.arange(5, dtype=torch.int32).view(1, 5)
+    p2n = ecp.remap_packed_ids(0, packed_neg)
+    check(int(p2n[0, 1]) == int(packed_neg[0, 1]) and int(p2n[0, 3]) == int(packed_neg[0, 3]),
+          "packed remap passes negative slots through untouched (no device assert)")
 
 
 def test_stash_and_hook():

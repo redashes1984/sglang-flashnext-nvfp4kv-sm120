@@ -257,19 +257,25 @@ def remap_topk_ids(layer_id, topk_ids):
     tbl = _remap_or_none(layer_id, topk_ids.device) if layer_id is not None else None
     if tbl is None:
         return topk_ids
-    return tbl[topk_ids.long()].to(topk_ids.dtype)
+    # padded/masked rows carry id=-1 (_mask_topk_ids_padded_region fill_value=-1):
+    # tbl[-1] would SILENTLY map them to the last expert's row. Keep -1 verbatim.
+    safe = topk_ids.clamp(min=0).long()
+    mapped = tbl[safe].to(topk_ids.dtype)
+    return torch.where(topk_ids >= 0, mapped, topk_ids)
 
 
 def remap_packed_ids(layer_id, packed):
     """StandardTopKOutputPacked carries ids in the high 16 bits (v1 convention).
-    int32 in / int32 out — dtype stability matters under graph replay."""
+    int32 in / int32 out — dtype stability matters under graph replay.
+    Negative packed values (id=-1 padding, (id<<16)|low) pass through untouched:
+    (& 0xFFFF) on them would index the table out of bounds -> device assert."""
     tbl = _remap_or_none(layer_id, packed.device) if layer_id is not None else None
     if tbl is None:
         return packed
     ids = ((packed >> 16) & 0xFFFF).long()
     low = packed & 0xFFFF
-    new_ids = tbl[ids].to(packed.dtype)
-    return (new_ids << 16) | low
+    new_ids = tbl[ids.clamp(max=tbl.numel() - 1)].to(packed.dtype)
+    return torch.where(packed >= 0, (new_ids << 16) | low, packed)
 
 
 _STASH_ROWS = 819  # subsample budget (rows of top-k per forward step)
@@ -287,12 +293,14 @@ def stash_demand(layer_id, pre_mask_logits, topk_ids, k):
         rows = int(topk_ids.shape[0])
         idx = topk_ids.reshape(rows, -1).long()
         width = int(pre_mask_logits.shape[-1])
-        idx = idx.clamp(max=width - 1)  # fused-shared-expert ids above width: masked later anyway
+        neg = idx < 0  # padded/masked rows: never feed them as demand for expert 0
+        idx = idx.clamp(min=0, max=width - 1)  # fused-shared-expert ids above width: masked later anyway
         # true scores from PRE-mask logits (renormalized/masked weights would poison
         # the strong-demand band test); raw-logit sigmoid — the scale factor is a
         # monotone constant on the softmax-free router and cancels in alpha comparisons
         logits2 = pre_mask_logits.reshape(rows, -1).float()
-        sc = torch.gather(logits2, 1, idx).sigmoid()
+        sc = torch.gather(logits2, 1, idx).sigmoid().masked_fill(neg, -1.0)
+        idx = idx.masked_fill(neg, -1)
         iff = idx.reshape(-1)
         sflat = sc.reshape(-1)
         if rows > _STASH_ROWS:
