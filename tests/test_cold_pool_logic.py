@@ -276,6 +276,46 @@ def test_inventory_gate():
     check(any("mystery_tensor" in str(b) for b in bad), f"gate flags unknown tensor: {bad}")
 
 
+def test_cold_probe_breaks_mask_starvation():
+    """T8 v2.8: with keep-mask armed, the router output NEVER contains a cold
+    gid (bias -inf) — the selection-path demand is structurally starved. The
+    probe on stashed raw logits must be what stages it. This is the field
+    deadlock found on CT112 (alpha=0.001 forced test still staged=0)."""
+    print("[T8] cold demand probe breaks mask starvation")
+    pool = ecp._STATE["layers"][0]
+    E, keep_len = 32, 20
+    pool.gid_row.clear(); pool.row_gid.clear()
+    pool.free_rows = [r for r in range(pool.keep_len, pool.phys)]
+    pool.need_counts = torch.zeros(E)
+    before = dict(pool.gid_row)  # empty by construction
+    # keep-only selection (mask applied), cold gid 25 strong in RAW logits
+    logits = torch.full((4, E), -10.0)
+    logits[:, :10] = 4.0     # keep experts win the masked topk
+    logits[:, 25] = 3.9      # cold expert INSIDE alpha band but never selected
+    masked = logits.clone()
+    masked[:, keep_len:] = -1e9  # what the router actually sees
+    topk_masked = masked.topk(10, dim=-1).indices
+    check(not (topk_masked >= keep_len).any(), "masked router selects keep only (starvation premise)")
+    for _ in range(4):
+        ecp.stash_demand(0, logits, topk_masked, 10)  # pass RAW logits, masked ids
+        ecp._STATE["stats"]["calls"] += 7
+        ecp.after_forward_hook()
+    added = set(pool.gid_row) - set(before)
+    check(25 in added, f"probe must stage in-band cold gid 25 (added={sorted(added)})")
+    # out-of-band cold must NOT come in: same setup, score far below alpha band
+    pool.gid_row.clear(); pool.row_gid.clear()
+    pool.free_rows = [r for r in range(pool.keep_len, pool.phys)]
+    pool.need_counts = torch.zeros(E)
+    logits_w = torch.full((4, E), -10.0)
+    logits_w[:, :10] = 4.0
+    logits_w[:, 24] = -9.0   # cold, weak — sigmoid band miss
+    for _ in range(4):
+        ecp.stash_demand(0, logits_w, topk_masked, 10)
+        ecp._STATE["stats"]["calls"] += 7
+        ecp.after_forward_hook()
+    check(24 not in pool.gid_row, "out-of-band cold gid 24 must not be staged by the probe")
+
+
 def main():
     test_shrink_and_stage()
     test_remap_fn()
@@ -284,6 +324,7 @@ def main():
     test_row_return_on_stage_failure()
     test_bias_dtype_sync_all_columns()
     test_inventory_gate()
+    test_cold_probe_breaks_mask_starvation()
     print()
     if FAIL:
         print(f"RESULT: {len(FAIL)} FAILURES")

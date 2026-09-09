@@ -313,16 +313,26 @@ def stash_demand(layer_id, pre_mask_logits, topk_ids, k):
         idx = idx.masked_fill(neg, -1)
         iff = idx.reshape(-1)
         sflat = sc.reshape(-1)
+        row_valid = (idx >= 0).any(dim=1)
         if rows > _STASH_ROWS:
             stride = (rows + _STASH_ROWS - 1) // _STASH_ROWS
             iff = idx[::stride].reshape(-1)
             sflat = sc[::stride].reshape(-1)
+            lg = logits2[::stride]
+            row_valid = row_valid[::stride]
+        else:
+            lg = logits2
+        # hook-side flat rows are the ids-filtered survivors: keep lg row-aligned
+        # by dropping fully-invalid rows HERE (a fully -1 row contributes to
+        # neither hot_min nor the probe).
+        lg = lg[row_valid]
     cap = _STASH_ROWS * k
     buf = _STASH.get(lay)
     if buf is None:
         buf = {
             "ids": torch.full((cap,), -1, dtype=torch.long, device=iff.device),
             "scores": torch.full((cap,), -1.0, dtype=torch.float32, device=iff.device),
+            "logits": None, "logits_n": 0,
         }
         _STASH[lay] = buf
     m = min(int(iff.numel()), cap)
@@ -331,6 +341,12 @@ def stash_demand(layer_id, pre_mask_logits, topk_ids, k):
         buf["ids"][m:].fill_(-1)
         buf["scores"][:m] = sflat[:m]
         buf["scores"][m:].fill_(-1.0)
+        # v2.8: the MASKED router can never re-discover cold demand (bias -inf
+        # removes them from topk) — stash the raw sampled logits so the hook
+        # probes the alpha band directly. rows>=m/k are all -1-invalid, so the
+        # hook aligns lg with the surviving valid rows by row order.
+        buf["logits"] = lg
+        buf["logits_n"] = int(lg.shape[0])
     mark_dirty()
 
 
@@ -702,6 +718,31 @@ def after_forward_hook():
         is_cold = pool.cold_mask_gpu[flat]
         hot_min = torch.where(~is_cold, sc, torch.full_like(sc, float("inf"))).amin(dim=-1, keepdim=True)
         strong = is_cold & (sc >= alpha * hot_min)
+        # v2.8 COLD DEMAND PROBE: masked cold experts can never appear in
+        # topk output (bias -inf), so the selected-ids path alone starves the
+        # pool forever. Re-check the alpha band on RAW pre-mask logits: any
+        # cold expert scoring >= alpha*hot_min in the row is demand.
+        lg = buf.get("logits")
+        lgn = int(buf.get("logits_n") or 0)
+        probe_rows = min(lgn, flat.shape[0])
+        if lg is not None and probe_rows > 0:
+            with torch.no_grad():
+                sc_full = lg[:probe_rows].sigmoid()  # (rows, E) fp32
+                rowmin = hot_min[:probe_rows]
+                band = sc_full >= alpha * rowmin
+                coldband = band & pool.cold_mask_gpu.unsqueeze(0)
+                # exclude ids already staged (in gid_row) — mask their columns
+                if pool.gid_row:
+                    staged_cols = torch.tensor(list(pool.gid_row.keys()), dtype=torch.long, device=flat.device)
+                    coldband[:, staged_cols] = False
+                if coldband.any():
+                    hit = coldband.float()  # (rows, E)
+                    vals, argmax_g = hit.mul(sc_full).max(dim=-1)
+                    sel_g = argmax_g[vals > 0]
+                    if sel_g.numel():
+                        pool.need_counts = pool.need_counts if pool.need_counts is not None else torch.zeros(pool.E, dtype=torch.float32, device=flat.device)
+                        pool.need_counts.index_add_(0, sel_g, torch.ones(sel_g.numel(), dtype=torch.float32, device=flat.device))
+                        st["strong"] += int(sel_g.numel())
         if pool.need_counts is None:
             pool.need_counts = torch.zeros(pool.E, dtype=torch.float32, device=flat.device)
         pool.need_counts.mul_(ema_decay())
@@ -731,5 +772,11 @@ def after_forward_hook():
         logger.info("[COLD-POOL] calls=%d strong=%d staged=%d evicted=%d demoted=%d promoted=%d h2d=%.2fGB",
                     st["calls"], st["strong"], st["staged"], st["evicted"], st["demoted"],
                     st["promoted"], st["h2d_bytes"] / 1e9)
+    elif debug_on() and st["calls"] % 128 == 0:  # TEMP probe: was 4096
+        # v2.7b: with keep-330 covering all synthetic demand, staged stays 0 and
+        # the gated line above never prints -> strong/hits invisible. Unconditional
+        # DEBUG cadence so soak can PROVE whether the demand path is dead or idle.
+        logger.info("[COLD-POOL] calls=%d strong=%d staged=%d evicted=%d h2d=%.2fGB (idle-cadence)",
+                    st["calls"], st["strong"], st["staged"], st["evicted"], st["h2d_bytes"] / 1e9)
     if debug_on() and st["calls"] % 256 == 0:
         _checksum_selfcheck()
