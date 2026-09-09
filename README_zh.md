@@ -28,7 +28,7 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 ## 相对基准版改了什么、为什么、效果如何
 
-调优版相对基准快照（`config/baseline/`）恰好七个改动点。汇总效果：**C1 +11% / C6 +36%**，下表即调优证据。
+调优版相对基准快照（`config/baseline/`）共八个改动点 —— 第 1–7 项是二次调优，第 8 项是叠加其上的第三轮 nvfp4kv-1m 试验层。第 1–7 项汇总效果：**C1 +11% / C6 +36%**，下表即调优证据。
 
 | # | 改动（基准 → 调优） | 为什么 | 效果 |
 |---|---|---|---|
@@ -39,6 +39,7 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 | 5 | `speculative-attention-mode`：不设（prefill 路径）→ **decode** | verify/draft 批次形状就是 decode 形状，路由到 trtllm_mha/XQA 才对得上；真实 prefill 批次不受影响（仍走 triton） | C1/C6 各 +2–4%，accept 分布不变 |
 | 6 | FR-Spec 投机热表：无 → **自建 64K 表**（`speculative-token-map: frspec_map_64k.pt`，coverage 1.0） | 用自有语料（obsidian 笔记 + skill 文件 → 65,536 IDs）重建草稿接受源，比通用表命中率更高；表 hash 进 cache namespace，旧前缀自动隔离 | accept len ≈2.0 → 2.0–2.3；注意：换表后 prefix cache namespace 一次性重置，需预热 2–3 轮 |
 | 7 | MTP steps：3 → **2**（draft=3/topk=1） | fp4 KV 下 steps=3 的接受率增益填不平随 verify token 数线性涨的 dequant 开销；实测 steps=3：C1 掉到 ~133–135，accept rate 波动 0.29–0.62 | steps=2 是甜点；此结论在基准期已定，调优后复验依旧成立 |
+| 8 | *（第三轮叠加）* int8 mamba ckpt 池：关（上游对 PLE side states 直接 ValueError 拒绝共存）→ 补丁 0002 PLE 镜像后**开** | 1M 上下文下 BF16 ckpt 槽是下一个显存前沿；镜像开销 <10 MB/槽 vs 时间态 ~27 MB/槽 —— 详见「第三轮」一节及 PR #38619 | ckpt 池 48 槽 / 1.42 GB，由 KV 池 1441792→1179648 腾资；soak 326/326；大量不同长前缀的驱逐余量 |
 
 写进 unit 的操作性约束：`mamba-radix-cache-strategy` 和 `ple-offload-embedding` 是别名/BooleanOptionalAction 参数，YAML ConfigArgumentMerger 不认（`DeprecatedAliasStoreAction` 报错）—— 只能以 CLI flag 形式留在 systemd `ExecStart`，不进 YAML。
 

@@ -28,7 +28,7 @@ Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6
 
 ## What changed vs baseline, why, and what it bought
 
-The tuned version differs from the baseline snapshot (`config/baseline/`) on exactly seven points. Aggregate effect: **+11% C1 / +36% C6**; the tuning evidence lives in this table.
+The tuned version differs from the baseline snapshot (`config/baseline/`) on eight points — items 1–7 are the round-2 tuning, item 8 is the round-3 nvfp4kv-1m trial layer on top. Aggregate effect of items 1–7: **+11% C1 / +36% C6**; the tuning evidence lives in this table.
 
 | # | Change (baseline → tuned) | Why | Effect |
 |---|---|---|---|
@@ -39,6 +39,7 @@ The tuned version differs from the baseline snapshot (`config/baseline/`) on exa
 | 5 | `speculative-attention-mode`: unset (prefill path) → **decode** | Verify/draft batches are decode-shaped; routing them to trtllm_mha/XQA matches the real batch shape. Does NOT touch real prefill batches (stay on triton) | +2–4% on both C1 and C6; accept distribution unchanged |
 | 6 | FR-Spec speculative token map: none → **self-built 64K hot table** (`speculative-token-map: frspec_map_64k.pt`, coverage 1.0) | Draft acceptance improved by seeding from our own corpus (obsidian notes + skill files → 65,536 IDs); map hash enters the cache namespace so old prefixes are auto-isolated | accept len ≈2.0 → 2.0–2.3; caveat: one-time prefix-cache namespace reset after swapping the table (warm 2–3 rounds) |
 | 7 | MTP steps: 3 → **2** (with draft=3/topk=1) | steps=3's accept-rate gain doesn't pay for the linear dequant cost under fp4 KV; measured steps=3: C1 drops to ~133–135, accept rate noisy 0.29–0.62 | steps=2 is the sweet spot; carried into baseline too but re-verified here |
+| 8 | *(round-3 layer)* int8 mamba checkpoint pool: OFF (upstream ValueError-guarded against PLE side states) → **ON** via patch 0002 PLE mirrors | At 1M ctx the BF16 ckpt slots are the memory frontier; mirrors cost <10 MB/slot vs ~27 MB/slot temporal — see §Third round and PR #38619 | ckpt pool 48 slots / 1.42 GB funded by pool 1441792→1179648; soak 326/326; eviction headroom for many distinct long prefixes |
 
 Operational note baked into the units: `mamba-radix-cache-strategy` and `ple-offload-embedding` are alias/BooleanOptionalAction args that the YAML ConfigArgumentMerger rejects (`DeprecatedAliasStoreAction`) — they must stay as CLI flags in the systemd `ExecStart`, never in the YAML.
 
