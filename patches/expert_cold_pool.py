@@ -366,17 +366,20 @@ class LayerPool:
 
 
 def _alias_names(module, target):
-    """All attribute names bound to the same Parameter object as `target`."""
-    names = []
-    for name, p in module.named_parameters(recurse=False):
-        if p is target:
-            names.append(name)
+    """All attribute names bound to the same Parameter object as `target`.
+    NOTE: must iterate _parameters directly — named_parameters() dedups
+    (remove_duplicate=True) so a two-name alias would only yield ONE name."""
+    names = [nm for nm, p in module._parameters.items() if p is target]
     return names or [None]
 
 
 def _replace_with_aliases(module, name, new_t):
-    """Replace `name` and bind every alias attribute to the SAME new Parameter."""
-    import sglang.srt.layers.utils.common as u
+    """Replace `name` and bind every alias attribute to the SAME new Parameter.
+    MF1 (star audit, 69/FAIL): replace_parameter lives in
+    sglang.srt.layers.quantization.utils (NOT layers.utils.common — that module
+    has copy_or_rebind_param/alias_or_bind_derived_param). Wrong import = the
+    first cold-pool shrink raises AttributeError = zero delivery."""
+    from sglang.srt.layers.quantization.utils import replace_parameter as _rp
 
     target = module._parameters.get(name)
     if target is None:
@@ -386,7 +389,9 @@ def _replace_with_aliases(module, name, new_t):
     aliases = _alias_names(module, target)
     new_p = torch.nn.Parameter(new_t, requires_grad=False)
     for nm in aliases:
-        u.replace_parameter(module, nm, new_p)
+        # real impl re-registers when storage/dtype differ (our shrink always does);
+        # trailing setattr pins every alias to the ONE new_p object (shared storage)
+        _rp(module, nm, new_p)
         setattr(module, nm, new_p)
     return new_p
 

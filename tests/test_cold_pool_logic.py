@@ -83,9 +83,11 @@ def test_shrink_and_stage():
 
     model = torch.nn.Module()
     model.child = torch.nn.ModuleList([m])
-    # fake FusedMoE class match: patch _iter via monkeypatching isinstance check —
-    # instead call the internals directly (keep the test sglang-free)
-    # replicate maybe_shrink_after_process on this module
+    # v2.3 / MF1 regression guard: call the REAL _replace_with_aliases (imports
+    # sglang.srt.layers.quantization.utils.replace_parameter on CT112) — the old
+    # test hand-rolled setattr and reported false green while a broken import
+    # path (layers.utils.common) would have crashed the first real shrink.
+    import sglang.srt.layers.quantization.utils as _q_utils  # noqa: F401
     pool = ecp.LayerPool(0, keep, list(range(keep_len, E)), slots, m, E)
     dev = m.w13_weight.device
     keep_idx = torch.tensor(keep, dtype=torch.long)
@@ -97,7 +99,11 @@ def test_shrink_and_stage():
             pool.host.setdefault(gid, {})[name] = cold_rows[i]
         new_t = torch.zeros((pool.phys,) + tuple(t.shape[1:]), dtype=t.dtype)
         new_t[: pool.keep_len] = t.index_select(0, keep_idx)
-        setattr(m, name, torch.nn.Parameter(new_t, requires_grad=False))
+        ecp._replace_with_aliases(m, name, new_t)
+    check(m.w13_weight_scale is m.w13_blockscale_swizzled
+          and m.w13_weight_scale.data_ptr() == m.w13_blockscale_swizzled.data_ptr(),
+          "swizzle alias stays SAME Parameter+storage after real replace (both names rewritten)")
+    check(m.w2_weight_scale is m.w2_blockscale_swizzled, "w2 alias pair synced too")
     ecp._STATE["layers"][0] = pool
     ecp._STATE["shrunk"] = True
     ecp._STATE["dynamic"] = True
