@@ -49,8 +49,12 @@ for line in (f"Environment=SGLANG_EXPERT_KEEP_MASK={keep}",
              "Environment=SGLANG_EXPERT_KEEP_OFFLOAD=1",
              "Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=16",
              "Environment=SGLANG_COLD_DEBUG=1"):
-    key = line.split("=", 1)[0] + "="
-    s = re.sub(rf"^#?Environment={key}.*\n", "", s, flags=re.M)
+    # BUGFIX (audit 2026-09-10): the old key was line.split("=",1)[0]+"=" which is
+    # "Environment=", so the dedup regex never matched and EVERY re-arm stacked a
+    # fresh copy of the four vars (found live: fp8kv unit had them 4x). Use the
+    # actual var name.
+    key = line.split("=", 2)[1]
+    s = re.sub(rf"^#?Environment={key}=.*\n", "", s, flags=re.M)
     s = s.replace("Environment=CUDA_HOME=", line + "\nEnvironment=CUDA_HOME=", 1)
 if "--enable-int8-mamba-checkpoint" not in s:
     s = s.replace("--mamba-radix-cache-strategy=extra_buffer_lazy",
