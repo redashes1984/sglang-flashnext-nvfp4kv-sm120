@@ -29,16 +29,16 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 1179648                  # 1M+128K：int8 ckpt(1.42GB)+prefill 瞬时激活 实测6x74K并发OOM，再降131K换0.84GB headroom→~3.1GB
+max-total-tokens: 2359296                  # boundary probe +262K over 2M
 context-length: 1048576                    # YaRN x4; override in json-model-override-args
-max-running-requests: 6
+max-running-requests: 12
 max-prefill-tokens: 16384
 chunked-prefill-size: 4096
 
 # --- Scheduler (QSA hybrid) ---
 schedule-policy: lpm
-max-mamba-cache-size: 24                  # radix ON: measured peak usage 0.62 (~20 slots) + headroom; pennyroyal 同款钉法
-#1M-OFF gdn-mtp-cache-mode: none
+max-mamba-cache-size: 48                  # conc12 x 4 slots/req (spec mode) = 48 strict
+gdn-mtp-cache-mode: none
 
 # --- Mamba / GDN ---
 mamba-ssm-dtype: bfloat16
@@ -47,19 +47,19 @@ mamba-track-interval: 64
 # --- CUDA Graph ---
 cuda-graph-config:
   decode:
-    bs: [1, 2, 4, 6]
-    max_bs: 6   # T1: 实测 spec-off decode 图到底崩不崩
+    bs: [1, 2, 4, 6, 8, 10, 12]
+    max_bs: 12   # conc12 trial 2026-09-10
   prefill:
     backend: disabled      # 同上；fp8kv 1M 实验同款处置
 
 # --- Speculative decoding NEXTN ---
-#1M-OFF speculative-algorithm: NEXTN
-#1M-OFF speculative-num-steps: 2
-#1M-OFF speculative-eagle-topk: 1
-#1M-OFF speculative-num-draft-tokens: 3
-#1M-OFF speculative-draft-model-quantization: unquant
-#1M-OFF speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA), 替代默认 prefill 路径
-#1M-OFF speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec: 自建 65536 中文增强热表(coverage 1.0); map hash 进 cache namespace,自动隔离旧 prefix cache
+speculative-algorithm: NEXTN
+speculative-num-steps: 2
+speculative-eagle-topk: 1
+speculative-num-draft-tokens: 3
+speculative-draft-model-quantization: unquant
+speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA), 替代默认 prefill 路径
+speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec: 自建 65536 中文增强热表(coverage 1.0); map hash 进 cache namespace,自动隔离旧 prefix cache
 
 # --- RoPE YaRN x4 (1M) ---
 json-model-override-args:

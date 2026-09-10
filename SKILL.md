@@ -1,6 +1,6 @@
 ---
 name: deploy-qwen-flash-next-nvfp4kv-sm120
-description: Reproduce both tuned Qwen3.8-Flash-Next sglang schemes on one RTX PRO 6000 (SM120) — nvfp4kv mainline (round-3 1M trial state) plus fp8kv rollback, each with baseline snapshots.
+description: Reproduce both tuned Qwen3.8-Flash-Next sglang schemes on one RTX PRO 6000 (SM120) — nvfp4kv mainline (round-4 expert cold-pool state) plus fp8kv rollback, each with baseline snapshots.
 ---
 
 # Deploy Qwen3.8-Flash-Next with NVFP4 KV on one RTX PRO 6000 (SM120)
@@ -9,15 +9,15 @@ Self-contained recipe for any agent (or human) to stand up this exact stack, ver
 
 ## What this is
 
-Qwen3.8-Flash-Next is a 180B hybrid MoE (GDN linear attention + QSA sparse attention + native NEXTN MTP) whose official FP8 checkpoint weighs ~173 GB and needs multi-GPU. A quantized community checkpoint (~102 GB NVFP4 with BF16 PLE table, or the smaller FP8-PLE variant) fits one RTX PRO 6000 Blackwell 96 GB (SM120). This stack runs it with `nvfp4` KV cache + QSA on sglang `qwen4-main-squashed` builds. The live nvfp4kv instance is the **round-3 nvfp4kv-1m trial state**: 1M context at conc 6 with the int8 mamba checkpoint pool enabled (patch 0002), spec decoding OFF. The fp8kv rollback scheme carries the portable subset of the tuning with spec ON (§Switching below).
+Qwen3.8-Flash-Next is a 180B hybrid MoE (GDN linear attention + QSA sparse attention + native NEXTN MTP) whose official FP8 checkpoint weighs ~173 GB and needs multi-GPU. A quantized community checkpoint (~102 GB NVFP4 with BF16 PLE table, or the smaller FP8-PLE variant) fits one RTX PRO 6000 Blackwell 96 GB (SM120). This stack runs it with `nvfp4` KV cache + QSA on sglang `qwen4-main-squashed` builds. The live nvfp4kv instance is the **round-4 expert cold-pool state**: 1M context at conc 12, spec decoding ON (NEXTN steps=2), KV pool 2,359,296, with only 346/512 routed experts physically on GPU (keep 330 + 16 dynamic slots; 166 cold experts demand-staged from 24.15 GB pinned host). The fp8kv rollback scheme carries the portable subset of the tuning with spec ON (§Switching below).
 
-Stack generations, each documented in README §Results as its own column: baseline → round-2 tuned (C1 ≈136 / C6 ≈550–575, spec-on 768K) → round-3 nvfp4kv-1m trial (live). Do not overwrite a generation's numbers with the next one's — the chain is the evidence.
+Stack generations, each documented in README §Results as its own column: baseline → round-2 tuned (C1 ≈136 / C6 ≈550–575, spec-on 768K) → round-3 nvfp4kv-1m trial (spec-off at 1M, int8 ckpt pool) → round-4 expert cold pool (live). Do not overwrite a generation's numbers with the next one's — the chain is the evidence.
 
 Each scheme ships tuned-plus-baseline: active files in `config/`, pre-tuning snapshots as same-suffix `.baseline.*` under `config/baseline/` (rollback anchors + before/after evidence). `nvfp4kv` is the current mainline; `fp8kv` is the tuned rollback scheme — see §Switching to the fp8 KV scheme.
 
 ## Prerequisites
 
-- Linux host, one RTX PRO 6000 Blackwell (SM120), ≥96 GB VRAM, ≥128 GB system RAM (PLE n-gram table lives pinned in CPU RAM ~44–51 GB depending on variant).
+- Linux host, one RTX PRO 6000 Blackwell (SM120), ≥96 GB VRAM, ≥128 GB system RAM (PLE n-gram table lives pinned in CPU RAM ~44–51 GB depending on variant; the round-4 cold pool adds another ~24–25 GB of pinned host memory).
 - sglang built from the `qwen4-main-squashed` branch head (PR #36497) compiled for SM120: `CUDAARCHS=120 TORCH_CUDA_ARCH_LIST="12.0"`, PyTorch cu13x. See `jpezzulli/sglang-rtxpro6000` and `gabrielolympie/sglang-flashnext-sm120` for build notes. Verify: `python3 -c "import sglang; print(sglang.__version__)"` in `/opt/sglang-env`.
 - **Patch-tree base pin:** `/opt/sglang-patch` (the overlay for patch 0002) must be built on the pinned baseline commit `78c5024e9`, not latest HEAD. Newer HEAD's `memory_pool.py` imports `set_mla_kv_buffer_dcp_sharded_triton`, absent from the baseline's `utils.py` → ImportError on full boot. Re-apply `patches/0002-mamba-ckpt-ple.diff` onto a fresh checkout of the pinned commit; don't merge HEAD files into the overlay.
 - A quantized checkpoint with its chat template in the model dir (NVFP4 experts + BF16 PLE works; the FP8-PLE variant fits tighter RAM budgets). The tokenizer must be the Qwen BPE — the FR-Spec token map is tokenizer-specific.
@@ -53,16 +53,23 @@ Each scheme ships tuned-plus-baseline: active files in `config/`, pre-tuning sna
    curl -s localhost:8000/get_server_info | python3 -c "import json,sys;d=json.load(sys.stdin);print('ctx',d.get('context_length'),'conc',d.get('max_running_requests'),'KV',d.get('max_total_tokens'),'spec',d.get('speculative_algorithm'),'ckpt',bool(d.get('enable_int8_mamba_checkpoints')),'gdn',d.get('linear_attn_prefill_backend'))"
    journalctl -u sglang-dealignai-qwen4exp-nvfp4kv --since -10m | grep 'int8 mamba checkpoint pool'
    ```
-   Expected live values on the round-3 stack: ctx 1048576, conc 6, KV pool 1179648, spec None (OFF), ckpt True, gdn flashinfer; journal shows `int8 mamba checkpoint pool: 48 slots, 1.42GB (qdata 1.29 + scale 0.02 + conv 0.10 + ple 0.01); active mamba pool 24 slots`. Then run one real chat completion and watch the journal for late `device-loaded` lines (`journalctl -u sglang-dealignai-qwen4exp-nvfp4kv --since -10m | grep -c 'device-loaded'` → should trend to zero after warmup).
+   Expected live values on the round-4 stack: ctx 1048576, conc 12, KV pool 2359296, spec EAGLE/NEXTN steps=2, ckpt True (96 slots, 2.81GB), gdn flashinfer. Then run one real chat completion and watch the journal for late `device-loaded` lines (`journalctl -u sglang-dealignai-qwen4exp-nvfp4kv --since -10m | grep -c 'device-loaded'` → should trend to zero after warmup).
+7. **(Round 4, optional) Expert cold pool.** The cold pool turns the ~30 GB of GPU expert-weight savings into the bigger KV pool + revived spec decoding. Install into the same `/opt/sglang-patch` overlay:
+   ```bash
+   cp patches/expert_cold_pool.py $S/layers/moe/expert_cold_pool.py   # $S = overlay srt dir
+   /opt/sglang-env/bin/python scripts/deploy_expert_cold_pool.py       # 5 anchors, idempotent
+   /opt/sglang-env/bin/python tests/test_cold_pool_logic.py            # T1–T9, CPU-only, expects ALL PASS
+   ```
+   Ship `config/expert_keep_330_final.json` next to the YAML. Unit env: `SGLANG_EXPERT_KEEP_MASK=<that json>`, `SGLANG_EXPERT_KEEP_OFFLOAD=1`, `SGLANG_EXPERT_COLD_POOL_SLOTS=16`. Use `scripts/switch_coldpool.sh {eager|graphs|mtp|off}` to walk the validation ladder — **eager first** (proves staging correctness without graph variables), then `graphs`, then `mtp`. Arm proof in journal: `[COLD-POOL] SHRUNK 48 layers keep=[330] +16 slots -> host pinned 24.15 GB`. Under `SGLANG_COLD_DEBUG=1`, `checksum selfcheck: 8448 rows OK` with zero MISMATCH is the staging-correctness gate. Red lines (from the v1 incident, enforced by design): shrink strictly after `process_weights_after_loading`; staging only in the after-forward hook, never inside graph replay; gate tables updated by content, shapes constant; NVFP4 per-expert tensors explicitly inventoried — unknown tensor refuses to arm.
 
 ## Bench
 
 ```bash
 python3 scripts/bench_gdn.py            # or your own harness: C1 latency sweep + C6 aggregate
 ```
-Reference hot-state numbers for the round-3 nvfp4kv-1m trial stack (same GPU, this sglang build): C1 ≈75–90 tok/s, C6 aggregate ≈72–91 tok/s, prefill ≈9.7K tok/s fresh-prefix (higher on radix hits). Run twice — first pass warms caches. If your numbers are far off, check the eight tuning items (below) are all present. Reference hot-state for the fp8kv scheme instead: C1 ≈165 / C6 aggregate ≈355–365 tok/s (conc4, spec-on, steps=3).
+Reference hot-state numbers for the round-4 cold-pool stack (same GPU, this sglang build): **C1 ≈146–171 tok/s, C12 aggregate ≈773–825 tok/s**, prefill ≈9.7K tok/s fresh-prefix (higher on radix hits), accept len 2.15–2.27 / rate 0.5–0.8. Run twice — first pass warms caches. If your numbers are far off, check the eight tuning items (below) and the cold-pool arm line are all present. Round-3 reference (spec-off, conc6, pool 1.18M): C1 ≈75–90 / C6 ≈72–91. Round-2 (spec-on 768K): C1 ≈136 / C6 ≈550–575. fp8kv scheme: C1 ≈165 / C6 aggregate ≈355–365 tok/s (conc4, spec-on, steps=3).
 
-Why nvfp4kv C1 looks low next to fp8kv: spec-off at 1M plus gather-dequant overhead. The trade is deliberate — 2× context capacity (1M vs 512K) and eviction headroom for many distinct long prefixes. If single-stream latency dominates, switch schemes instead of tuning around it.
+Why round-4 C1 (≈146–171) is now level with fp8kv (≈165): the round-3 gap was mostly the spec-off tax, not gather-dequant alone — the cold pool's freed VRAM funds NEXTN again at 1M. Log-reading gotchas: `gen throughput` in the first decode line after an idle gap (or a new request's first window) is polluted by prefill/sleep-on-idle in the denominator — it can read 0.5 tok/s while the true rate is 136; trust consecutive-window values or a wall-clock curl timing, never the first line. Greedy byte-level output is nondeterministic **even with the cold pool fully OFF** (atomics/cuBLAS runtime property, proven by OFF-control) — never gate on raw byte equality.
 
 ## Tuning items vs baseline (what changed, why, effect)
 
@@ -87,6 +94,11 @@ Use it when single-stream decode matters most — fp8kv is ahead at C1 (≈165 v
 
 ## Pitfalls checklist
 
+- **Concurrency 12 is a three-knob change, and mamba clamps silently.** Raise `max-running-requests`, the decode-CG `bs` list + `max_bs`, AND `max-mamba-cache-size` together. Under spec mode each request eats **4** mamba state slots (not the 2 visible in `mamba num` log lines) — 32 slots silently clamped conc 12 back to 8 with `max_running_requests is capped to 8 by the mamba state cache` in the journal; 48 slots = 12×4 is what makes 12 stick. The int8 ckpt pool doubles alongside (96 slots, 2.81 GB). Verify `max_running_requests=12` in the boot summary, not just the YAML.
+- **First decode line lies.** `gen throughput` on the first window after idle (or a request's first window) divides by a denominator polluted with prefill/sleep-on-idle wait — read 0.5 tok/s once while wall-clock measured 136. Use consecutive-window values or curl timing.
+- **MTP drafts share decoder `layer_id` in-process.** Any per-layer runtime hook gated on `layer_id` alone will hijack the NEXTN draft model (same class, layer 0 collides) — cold pool v2.9 gates on TopKConfig object identity registered at shrink. Symptom if you reintroduce the bug: accept rate collapses to ~0.21 with drafts masked+remapped.
+- **A keep-masked router starves its own cold pool.** If staging never fires (`staged=0` after real traffic), the demand signal is coming from selection-path ids that the -inf mask already excluded — probe raw **pre-mask** logits in the alpha band instead. And any stash-buffer slice read before refill must be `.clone()`d: a view erased by `fill_` silently killed the strong-demand filter once.
+- **Cold-pool pinned RAM is real RAM:** 24.15 GB flat pins (48 × ~512 MB exact-size uint8 buffers — never pin per-parameter, `CachingHostAllocator` power-of-two rounding wasted 40.5 GB doing that) + PLE's 64 GB on a 112 GB box. Check MemAvailable/swap before adding any other pinned consumer.
 - **Warmup oneshot silent no-op:** after restarting the main service, `systemctl start` on the warmup unit can no-op if it already recorded `Finished`. Use `systemctl restart sglang-dealignai-nvfp4kv-warmup` and confirm `[warmup-fp4kv] warmup complete` in its journal before benchmarking. Skipping warmup on the tight round-3 pool is how late-load OOM bites on first real traffic.
 - **Overlay must load:** if boot log lacks the `int8 mamba checkpoint pool:` line, the PYTHONPATH overlay didn't take (check `/proc/<pid>/environ` after daemon-reload+restart — a stale process keeps old env).
 - HiCache MUST be off with nvfp4 KV (scale buffers skipped on host transfer → silent corruption; upstream #36121). fp8 KV can keep HiCache ON.

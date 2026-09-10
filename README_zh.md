@@ -2,29 +2,30 @@
 
 [English](README.md) | **简体中文**
 
-**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，现役主线；线上实例跑的是第三轮 nvfp4kv-1m 试验态）与 `fp8kv`（`fp8_e4m3`，回滚方案，吸收了同一批调优中可移植的一半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
+**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，现役主线；线上实例跑的是第四轮专家冷池态）与 `fp8kv`（`fp8_e4m3`，回滚方案，吸收了同一批调优中可移植的一半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
 
 上游 sglang 无法让 NVFP4 *KV cache* 与 Qwen 稀疏注意力（QSA）共存：Triton gather 路径拿到的是打包 fp4 缓冲区，直接死在 `KeyError: 'float4_e2m1fn_x2'`。本仓库给出可用的修复（移植自 [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) 的 MIT 补丁，并针对 dspark 的 SM121 环境根本走不到的 SM120 trtllm-gen 稀疏解码路径做了适配），外加整套调优经验：sampler OOM 修复（[#37962](https://github.com/sgl-project/sglang/issues/37962) 同类问题）、HiCache 硬性约束、fp4 KV 下的 radix cache 经济学、完整的投机解码 steps 校准。
 
 前作基础：[jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) 与 [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) —— 两家都是 fp8-KV；**本仓库补上的是他们没有的 nvfp4-KV 数据点**。
 
-## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版）
+## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版 → 专家冷池）
 
-| | fp8kv 方案 | nvfp4kv 基准版 | nvfp4kv 二次调优版 | **nvfp4kv-1m 试验版（第三轮，现役）** |
-|---|---|---|---|---|
-| KV cache 类型 | fp8_e4m3 | nvfp4（打包 e2m1 + 分块 scale） | nvfp4 | **nvfp4** |
-| 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | 768K（YaRN ×3） | **1M（YaRN ×4 显式）** |
-| KV 池 | 552,960 | 786,432 | 851,968（回收 mamba 槽 +64K） | **1,179,648**（为 int8 ckpt 池腾资 + 启动余量后） |
-| 并发 | 4 | 6 | 6 | **6** |
-| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | **≈75–90 tok/s**（热态） |
-| 解码 C6 聚合 | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | **≈72–91 tok/s** |
-| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | **≈9.7K tok/s**（冷前缀；radix 命中更高） |
-| MTP（NEXTN）steps | 3 | 2 | 2（校准甜点） | **OFF**（1M 单卡下 steps≥1 即 OOM） |
-| Int8 mamba ckpt 池 | — | — | — | **开**（补丁 0002 × PLE 镜像，PR #38619） |
-| Radix 前缀复用 | 开 | 开 | 开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s | **开** |
-| HiCache L2 | **开**（fp8 下安全） | 关 | 关 | **关**（fp4 KV 硬约束，见约束一节） |
+| | fp8kv 方案 | nvfp4kv 基准版 | nvfp4kv 二次调优版 | nvfp4kv-1m 试验版（第三轮） | **专家冷池（第四轮，现役）** |
+|---|---|---|---|---|---|
+| KV cache 类型 | fp8_e4m3 | nvfp4（打包 e2m1 + 分块 scale） | nvfp4 | nvfp4 | **nvfp4** |
+| 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | 768K（YaRN ×3） | 1M（YaRN ×4 显式） | **1M（YaRN ×4 显式）** |
+| KV 池 | 552,960 | 786,432 | 851,968（回收 mamba 槽 +64K） | 1,179,648（为 int8 ckpt 池腾资 + 启动余量后） | **2,359,296**（keep330+16 冷池腾出 ~30GB 显存 → +118 万 token） |
+| 并发 | 4 | 6 | 6 | 6 | **12**（spec 下 mamba 4 槽/请求 → 48 槽） |
+| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s（热态） | **≈146–171 tok/s**（spec-on + 冷池在线） |
+| 解码聚合 | ≈355–365 tok/s（C6） | ~409 tok/s（C6） | ≈550–575 tok/s（C6） | ≈72–91 tok/s（C6） | **≈773–825 tok/s（C12）** |
+| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s（冷前缀；radix 命中更高） | **≈9.7K tok/s**（冷前缀；radix 命中更高） |
+| MTP（NEXTN）steps | 3 | 2 | 2（校准甜点） | OFF（1M 单卡下 steps≥1 即 OOM） | **开，steps=2**（冷池腾出的显存重新养得起投机） |
+| GPU 常驻路由专家 | 全部 512 | 全部 512 | 全部 512 | 全部 512 | **346/512**（330 keep + 16 动态槽；166 个冷专家进 24.15 GB pinned 内存，按需求搬运） |
+| Int8 mamba ckpt 池 | — | — | — | 开（补丁 0002 × PLE 镜像，PR #38619） | **开**（conc12 下 96 槽 / 2.81 GB） |
+| Radix 前缀复用 | 开 | 开 | 开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s | 开 | **开** |
+| HiCache L2 | **开**（fp8 下安全） | 关 | 关 | 关（fp4 KV 硬约束，见约束一节） | **关**（fp4 KV 硬约束，见约束一节） |
 
-nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 needle 测试、驱逐后前缀重查正确性、grammar JSON ×6、工具调用、零 retract、零报错。accept len ≈2.0–2.3，accept rate ≈0.5–0.66。
+nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 needle 测试、驱逐后前缀重查正确性、grammar JSON ×6、工具调用、零 retract、零报错。第四轮追加：CUDA graph 下 8448 行搬运校验逐字节一致、30 分钟验收 soak、12×66K 长文并发压测 —— 零 MISMATCH / stage_fail / OOM。accept len ≈2.0–2.6，accept rate ≈0.5–0.8。
 
 ## 相对基准版改了什么、为什么、效果如何
 
@@ -60,6 +61,31 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 补丁树卫生：`/opt/sglang-patch` 基于钉死的基线 commit `78c5024e9`，不是最新 HEAD —— 新版 `memory_pool.py` 引用了基线 `utils.py` 里不存在的 `set_mla_kv_buffer_dcp_sharded_triton`，混用会导致整服务启动 ImportError。正确做法是在该 commit 的干净检出上重新应用 `0002`，不要拷 HEAD 文件进去。
 
+## 第四轮（2026-09-10）：动态专家冷池 —— GPU 只养 346/512 专家，投机解码与 12 并发复活
+
+背景：1M 上下文下，路由专家的 NVFP4 权重（~86 GB 静态占用里约 68 GB）就是那堵墙 —— 第三轮为了养 KV 池不得不杀掉投机解码。机制参照 [ranxianglei/sglang `ours/main`](https://github.com/ranxianglei/sglang)（keep-mask 消融 + keep-only 卸载 + cold-pool v2 动态搬运，W4A16/GPTQ 栈）；`patches/expert_cold_pool.py` 是针对 **NVFP4 / `modelopt_fp4` / `flashinfer_cutlass`** 的重新实现 —— 参数名、scale 处理、graph 约束全都不同，没有照抄任何一个名字。
+
+工作原理（全部 env 门控；不设 `SGLANG_EXPERT_KEEP_MASK` + `SGLANG_EXPERT_KEEP_OFFLOAD=1` 就完全惰性）：
+
+1. **静态 keep-mask** —— 按路由频率普查产出的每层 keep 集（330/512，`config/expert_keep_330_final.json`），用常驻缓存 bias 列把冷专家从 router logits 里屏蔽掉（`torch.finfo.min`，首次 eager 调用时构建、按 `(layer_id, dtype)` 缓存 —— 图捕获内绝不做 list→CUDA 索引）。
+2. **加载后物理收缩** —— 钩在 `model_runner.load_model`，严格位于 `process_weights_after_loading` *之后*：张量清单门（NVFP4 行参数 + `weight_scale_2`/`input_scale` 标量 + 派生 `g1_alphas`/`g1_alphas_up`/`g2_alphas` 全部显式白名单；出现未知每专家张量**拒绝武装**），冷行拷进 host，GPU 张量重建为 `keep+slots=346` 行。**别名守卫**拒绝非同一对象的 `w*_blockscale_swizzled`（只有 `swizzle_blockscale` 无需 padding 时别名才成立 —— 配置漂移要响亮报错，不能让 kernel 静默吃旧数据）。
+3. **扁平 pin** —— `CachingHostAllocator` 把每个 ≥1MB 的 pin 请求向上取整到 2 的幂；按参数逐个 pin 时 24.2 GB 数据吃掉 40.5 GB。改为每层一个精确大小的 `uint8` 缓冲（48 × ~512 MB = 24.15 GB，浪费 3.7%），按专家发行视图。
+4. **图回放之外的需求搬运** —— `select_experts` 抽样暂存**屏蔽前**的原始 logits（被 -inf 屏蔽的冷专家永远不可能从选择路径产生需求 —— v2.8 冷需求探针在 alpha 带 `sigmoid ≥ 0.8 × hot_min` 上读原始 logits，需 2 次重复命中）；`model_runner` forward 后钩子把赢家搬进空闲/LRU 槽（H2D 走当前流），按**内容**更新常驻 remap+bias 表（形状永不变 → 图始终有效），驱逐先屏蔽后覆写。
+5. **v2.9 身份门** —— MTP 草稿层在**同一进程内**复用 decoder `layer_id 0..47`；只认 layer_id 的门控会把 target 的 mask+remap 静默套到草稿 router 上（accept rate 0.21，草稿全是垃圾）。现在要求调用方的 `TopKConfig` **对象身份**在收缩时被注册过 —— 草稿（未注册）原样放行。
+
+现役栈实测（冷池 ON + decode graphs + NEXTN steps=2，conc 12，池 2,359,296）：
+
+| 门禁 | 结果 |
+|---|---|
+| 搬运正确性 | 8448 行 host↔GPU 校验逐字节一致，eager 与 CUDA graph 双态通过；soak 全程零 MISMATCH / stage_fail / CUDA error |
+| 搬运活跃度 | 30 分钟 soak：staged 4997、h2d 13.82 GB；强制 alpha 证明：staged 1618 / evicted 850 |
+| 解码 C1 | **146–171 tok/s**（对比 graphs-only 无投机 104–105、第三轮 spec-off 75–90） |
+| 解码 C12 聚合 | **773–825 tok/s**，accept len 2.15–2.27 |
+| KV 池余量 | 冷池 OFF 对照在 1,572,864 直接 **OOM** → keep330+16 正是解锁池子的钥匙；2,359,296 启动后 torch-avail 7.1 GB，12×66K 长文压测峰值 92,694/97,887 MiB、真实围栏仍留 5.1 GB，零 OOM/retract |
+| 主机内存 | 112 GB 机器上：冷池 pinned 24.15 GB + PLE 表 64 GB —— soak 末 MemAvailable ~20 GB，swap 稳定 |
+
+诚实声明：需求探针目前是纯 torch 实现（eager 下 ~0.3 ms/层/拍 —— graph 态下不可见，Triton kernel 留给提速阶段）；keep=330/slots=16 是起点不是调优终点；原作者自己的结论（静态 keep 集 Pareto 最优、动态搬运 WIP）仍是我们要用 Phase B 数据去推翻的活假设；另外 greedy 字节级不确定性在**冷池完全关闭**时同样存在（atomics/cuBLAS 运行时属性，OFF 对照已证）—— 质量门禁是校验和 + 语义 + 错误计数，永远不是裸字节相等。
+
 ## fp8kv 方案（回滚栈）
 
 fp8kv 不是原始旧配置 —— 2026-09-08 它吸收了 nvfp4kv 调优中可移植的一半，两方案同卡互换不丢通用收益。
@@ -94,10 +120,17 @@ patches/
   0002-mamba-ckpt-ple.diff   int8 mamba checkpoint 池镜像 PLE side states
                              （short-conv bf16 / ngram int64 行），取代上游的
                              ValueError 守卫。对应上游 PR #38619。
+  expert_tier.py             v1 swap-in 原型 —— 原样保留作失败基线（约 10 分钟流量后
+                             输出腐坏）；expert_cold_pool.py 的 R1-R3 红线来源
+  expert_cold_pool.py        第四轮动态专家冷池（见「第四轮」一节）：keep-mask +
+                             pwal 后收缩 + 扁平 pin + 需求搬运 + v2.9 TopKConfig 身份门
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 第三轮（现役）：conc6 / 1M / spec OFF /
-                                    mamba24 钉死 / KV 池 1179648 / int8 ckpt ON（PLE 镜像，补丁 0002）/
-                                    decode CG bs[1,2,4,6] / spec-off 下 prefill CG disabled
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 第四轮（现役）：conc12 / 1M / spec ON
+                                    steps=2 / mamba48 / KV 池 2359296 / int8 ckpt ON（96 槽）/
+                                    冷池 keep330+16 / decode CG bs[1,2,4,6,8,10,12] /
+                                    prefill CG disabled
+  expert_keep_330_final.json        每层 keep 集（48 × 330 全局专家 id），路由频率普查产物
+                                    —— 冷池的武装输入
   dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案 · 调优后回滚栈（conc4 / 512K / MTP3 / mamba24 / HiCache ON；2026-09-08 移植可移植项：GDN 双端 flashinfer、prefill CG-full、SAM=decode、FR-Spec 热表、ABL=lazy —— steps 保持 3，fp8 accept-len 2.08–2.50 下深度投机仍是甜点）
   baseline/                         双方案调优前基准快照，作回滚锚点与前后对照证据：
                                     nvfp4kv —— mamba32 自动 sizing、KV 池 786432、无 FR-Spec 表、
@@ -108,6 +141,16 @@ config/
 scripts/
   test_ckpt_ple_patch.py     补丁 0002 的 CPU 集成测试 T1–T6（镜像往返、dtype
                               保真、factory 路径 kwargs 检查）
+  deploy_expert_cold_pool.py 冷池幂等钩子安装器（topk.py/model_runner.py 共 5 个锚点
+                              + v2.8→v2.9 升级通道；锚点计数校验 + py_compile）
+  switch_coldpool.sh         模式切换：eager（冷池 ON、decode CG 关）/ graphs（冷池
+                              ON、CG 开）/ mtp（冷池 + graphs + NEXTN 解注释）/
+                              off（完全回滚）
+  soak_watch_v2.sh           30 分钟混合流量 soak + journal 监视 + greedy 探针
+  soak_final.sh              轮换话题验收 soak + 内置日志分诊
+  log_triage.sh              journal ERROR/WARNING 清扫 + 分类
+  stress_conc12.sh           12 路短上下文并发压测 + GPU 峰值采样
+  stress_long12.sh           12 路 ~66K token 长文并发压测（安全围栏探针）
   frspec_map_64k.pt           FR-Spec 投机热表产物（65,536 IDs；sha256 598b0dc4… 与 manifest
                               一致；随仓库分发，保证调优栈可复现）
   frspec_map_64k.manifest.json  构建溯源：tokenizer sha256、语料文件清单（逐文件 sha256）、
@@ -116,9 +159,15 @@ scripts/
   warmup_qsa_nvfp4kv.py       在真实流量前进场加载，关掉 late-device-load OOM 窗口
                               （长 prefill、grammar bitmask、bs6 图桶）
   warmup_qsa_fp8kv.py         fp8 变体（含前缀缓存命中路径）
+tests/
+  test_cold_pool_logic.py    冷池 CPU 逻辑测试 T1–T9（收缩+搬运+remap+bias、打包
+                              remap、需求暂存、弱需求拒绝、清单门、空闲行记账、bias
+                              缓存刷新、屏蔽饥饿探针、身份门）
 docs/
   RESULTS.md                  完整压测矩阵、MTP steps 1–3 校准表、mamba 槽经济学、
                               每一条死路和根因
+  expert-dynamic-v2-design.md 冷池 v2 设计：v1 事故的 R1-R3 红线、Phase 0 张量清单门、
+                              eager 先行验证顺序、回滚门禁
 ```
 
 ## 关键发现（省流版）
@@ -130,6 +179,9 @@ docs/
 5. **MTP steps 必须按 KV 类型重新校准。** fp4 KV 下 steps=2 同时打赢 1 和 3（dequant 开销随 verify token 数线性涨；steps=3 的接受率增益填不平这个坑）。fp8 时代"steps 越多越好"的结论不迁移。
 6. **Radix 会翻转 mamba 槽经济学。** Radix OFF：~1 槽/请求（conc6 用 16 就够）。Radix ON：完成请求的 mamba 状态驻留等前缀复用 → ~3 槽/请求；配 extra_buffer_lazy 降到 ~4/请求，钉 24 即够。这几个旋钮是联动的，要一起调。
 7. **Triton 惰性进场加载是一类真实的 OOM。** 首次触发的 kernel 特化（GDN chunk prefill、sparse-GQA、xgrammar bitmask）会在池子打满*之后*才分配显存。真实流量进来之前把每个形状族都 warm 一遍；极端形状仍可能触发新特化 —— 用 journal 里的 `device-loaded` 做监控。
+8. **NVFP4 每专家侧张量会击穿 `dim0 == E` 启发式。** 除了 `w13/w2_weight` + 分块 scale，每个专家还有 `weight_scale_2`/`input_scale` 标量与派生 `g1_alphas`/`g1_alphas_up`/`g2_alphas`；`process_weights_after_loading` 会解交织 w13、swizzle scale、并把派生参数别名进源存储。收缩必须快照 **pwal 之后**的状态（钩在 `model_runner.load_model`，不是权重加载器里），白名单张量逐个往返校验，未知项拒绝武装。`w*_blockscale_swizzled` 只在与其源 Parameter 同对象时才安全 —— 为此设守卫。
+9. **被 keep-mask 屏蔽的 router 喂不饱自己的需求信号。** 冷专家是 -inf 屏蔽，选择路径的需求恒为 0，池子永久饥饿（实测：30 分钟流量 staged=0）。需求必须从**屏蔽前**原始 logits 的 alpha 带探测。同类陷阱：暂存缓冲的切片若在回填前读取必须 `.clone()` —— 一个被 `fill_` 抹掉的视图曾静默杀死探针 v1 的强需求过滤。
+10. **投机解码草稿与 decoder 共享进程内 `layer_id` 号段。** NEXTN 草稿模型就是同一个类、`num_hidden_layers=1` → 它的第 0 层与 target 第 0 层撞车。任何只按 layer_id 门控的每层运行时机制（mask、remap、统计）都会静默劫持草稿 —— 要按武装时注册的 TopKConfig **对象身份**门控（v2.9；症状：草稿被 mask+remap 后 accept rate 0.21）。
 
 ## 复现
 
@@ -147,19 +199,35 @@ git -C /opt/sglang-src/sglang apply ../patches/0001-sampler-37962-tp1-sync-skip.
 systemctl start sglang-dealignai-qwen4exp-nvfp4kv
 systemctl enable --now sglang-dealignai-nvfp4kv-warmup   # one-shot，等 /health
 
-# 3. 验证
+# 3.（第四轮，可选）专家冷池 —— overlay 树 + 钩子 + keep 集 + env
+cp -a /opt/sglang-src /opt/sglang-patch            # fork 隔离，基线 commit 钉死
+/opt/sglang-env/bin/python scripts/deploy_expert_cold_pool.py   # 5 锚点，幂等
+# patches/expert_cold_pool.py -> $S/layers/moe/expert_cold_pool.py
+# config/expert_keep_330_final.json -> /opt/sglang-config/
+# unit 需要：Environment=PYTHONPATH=/opt/sglang-patch/sglang/python
+#            Environment=SGLANG_EXPERT_KEEP_MASK=… SGLANG_EXPERT_KEEP_OFFLOAD=1
+#            Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=16
+/opt/sglang-env/bin/python tests/test_cold_pool_logic.py       # T1–T9，纯 CPU
+bash scripts/switch_coldpool.sh eager    # 先在 eager 态验证搬运
+bash scripts/switch_coldpool.sh graphs   # 再开 CUDA graph
+bash scripts/switch_coldpool.sh mtp      # 最后开 NEXTN 投机
+bash scripts/switch_coldpool.sh off      # 任何一步都可完全回滚
+
+# 4. 验证
 curl -s localhost:8000/v1/models          # → Qwen3.8-Flash-Next-NVFP4
 curl -s localhost:8000/get_server_info | jq '.kv_cache_dtype, .disable_radix_cache'
+journalctl -u sglang-dealignai-qwen4exp-nvfp4kv --no-pager | grep "COLD-POOL"  # SHRUNK 行
 ```
 
 nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`（用 fp8kv 方案文件）后，本仓库所有补丁均为惰性。要跑 fp8kv 方案：停 nvfp4kv unit，起 fp8kv 同名 unit 对（main + warmup），预期值见 §fp8kv 方案一节。
 
 ## 约束与诚实声明
 
-- 定档调优栈（2026-09-08 第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。第三轮热态：C1 ≈75–90 / C6 ≈72–91 / prefill ≈9.7K（冷前缀）。回滚 = 用 `config/baseline/` 文件覆盖现役文件后重启 unit。
+- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第四轮现役：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 48 / KV 池 2,359,296 / decode CG bs[1,2,4,6,8,10,12]。** 第四轮热态：C1 ≈146–171 / C12 聚合 ≈773–825 / prefill ≈9.7K（冷前缀）。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
 - 定档 fp8kv 栈（同日）：可移植项已移植（见 §fp8kv 方案）、steps 保持 3、HiCache 开、conc4 / YaRN×2 512K / KV 池 552,960、FR-Spec 热表共用。热态：C1≈165 / C6≈355–365 / accept len≈2.08–2.50。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
-- 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4 分钟。unit 故意不 enable，避免开机抢 GPU。
-- C1 解码仍低于 fp8（≈136 vs ≈165 tok/s，gather-dequant 的固有代价）；上游原生 fp4 QSA 解码池（#37798）能消掉这个差距。
+- 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4-5 分钟（第四轮多 ~3.5 分钟权重加载 + 收缩）。unit 故意不 enable，避免开机抢 GPU。
+- 第四轮主机内存预算是刻意压到极限的：冷池 pinned 24.15 GB + PLE 表 pinned 64 GB（47.7 GB 被 2 的幂取整 —— `file` 后端 A/B 已调研、暂缓）压在 112 GB 机器上 → soak 末 MemAvailable ~20 GB。再要挂任何 pinned 消费者之前先看 `Shmem` 与 swap。
+- 冷池 + 投机的 C1（≈146–171）已经追平 fp8kv（≈165）—— 第三轮"fp4 KV 更慢"的差距主要是 spec-off 税，不全是 gather-dequant。上游原生 fp4 QSA 解码池（#37798）是继续拉开差距的路。
 - 实验 unit 用 `Restart=no` 是故意的 —— 崩溃保留现场，不循环重启。
 - 所有数字来自单张 RTX PRO 6000（96 GB）、sglang `0.5.19.dev6+g78c5024e` + 本地补丁。SM121/GB10 是另一个故事（参考 gabrielolympie 关于该架构长上下文静默腐坏的记录）。
 - 更换 FR-Spec 热表会一次性重置 prefix cache namespace —— 换表后预热 2–3 轮再上真实流量。
@@ -170,6 +238,7 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 - [Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks)（MiaAI Lab，MIT）—— 本仓库移植并向 SM120 扩展的 dspark QSA×nvfp4 补丁
 - [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) —— sm120 铺路工作
 - [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) —— fp8-KV 性能天花板，本仓库 KV 权衡的参照系
+- [ranxianglei/sglang `ours/main`](https://github.com/ranxianglei/sglang) + [ranxianglei/sglang-expert-profile](https://github.com/ranxianglei/sglang-expert-profile) —— keep-mask / keep-offload / cold-pool v2 机制架构（W4A16），第四轮为其 NVFP4 重新实现
 
 ## 许可证
 

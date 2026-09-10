@@ -22,6 +22,10 @@ RestartSec=30
 
 Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONPATH=/opt/sglang-patch/sglang/python
+Environment=SGLANG_EXPERT_KEEP_MASK=/opt/sglang-config/expert_keep_330_final.json
+Environment=SGLANG_EXPERT_KEEP_OFFLOAD=1
+Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=16
+Environment=SGLANG_COLD_DEBUG=1
 Environment=CUDA_HOME=/usr/local/cuda
 Environment=PYTHONUNBUFFERED=1
 Environment=CUDA_VISIBLE_DEVICES=0
