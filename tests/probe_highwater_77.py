@@ -29,4 +29,5 @@ t, m = gen(cB + "\n锚点B的编号是什么？只答编号。", 16); log(f"B1 c
 t, m = gen(cC + "\n锚点C的编号是什么？只答编号。", 16); log(f"C1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
 t, m = gen(cA + "\n锚点A的编号是什么？只答编号。", 16); log(f"A2 reask={t:.1f}s cached={m.get('cached_tokens')}")
 t, m = gen(cB + "\n锚点B的编号是什么？只答编号。", 16); log(f"B2 reask={t:.1f}s cached={m.get('cached_tokens')}")
+t, m = gen(cC + "\n锚点C的编号是什么？只答编号。", 16); log(f"C2 reask={t:.1f}s cached={m.get('cached_tokens')}")
 log("HIGHWATER-DONE")

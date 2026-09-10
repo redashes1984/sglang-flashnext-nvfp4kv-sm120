@@ -8,18 +8,16 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/root
-
 # 与现役 unit 同构；仅 config 路径不同。Restart=no: 试验崩溃保留现场不循环重启。
 ExecStart=/opt/sglang-env/bin/sglang serve \
   --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --config /opt/sglang-config/dealignai-qwen4exp-nvfp4kv.yaml \
   --ple-offload-embedding \
   --mamba-radix-cache-strategy=extra_buffer_lazy \
-  --enable-int8-mamba-checkpoint
-
+  --enable-int8-mamba-checkpoint \
+  --mamba-max-states-per-path 16
 Restart=no
 RestartSec=30
-
 Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONPATH=/opt/sglang-patch/sglang/python
 Environment=SGLANG_EXPERT_KEEP_MASK=/opt/sglang-config/expert_keep_330_final.json
@@ -36,12 +34,9 @@ Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 Environment=SGLANG_SM120_LOWM_FP8_WEIGHT=1
 Environment=SGLANG_SM120_LM_HEAD_FP8=1
 Environment=SGLANG_ENABLE_SM120_LOWM_BF16_GEMM=1
-
 LimitNOFILE=65536
 LimitNPROC=4096
-
 StandardOutput=journal
 StandardError=journal
-
 [Install]
 WantedBy=multi-user.target

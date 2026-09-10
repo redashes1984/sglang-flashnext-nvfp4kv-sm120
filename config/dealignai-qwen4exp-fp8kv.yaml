@@ -28,7 +28,7 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 552960                # pinned: leave ~6GB post-pool headroom for fp8 copies + graphs
+max-total-tokens: 1310720                # B+ rung2: 2x full 524K co-resident (prev 819200); 12GB post-capture headroom kept
 context-length: 524288                  # YaRN x2 (override 见 json-model-override-args)
 max-running-requests: 4
 max-prefill-tokens: 16384
@@ -36,7 +36,7 @@ chunked-prefill-size: 4096              # 1024 -> 4096, prefill 吞吐主提升
 
 # --- Scheduler (QSA hybrid) ---
 schedule-policy: lpm
-max-mamba-cache-size: 24                # ~6x maxreq
+max-mamba-cache-size: 48                # anchor-slot ladder: 24 starved 3x336K radix reuse (mismatch probe cached=0), 48 for anchor LRU headroom; int8 ckpt auto-sizes 2x
 gdn-mtp-cache-mode: none                # T1: skip intermediate h-state caching, reconstruct after verify
 # ReplaySSM 已评估并放弃：上游校验 (server_args.py _handle_linear_replayssm) 要求
 # linear-attn-decode-backend=triton，与 flashinfer GDN decode 互斥；flashinfer 收益已定档，不换。
@@ -56,9 +56,9 @@ cuda-graph-config:
 
 # --- Speculative decoding NEXTN (migrated from systemd) ---
 speculative-algorithm: NEXTN
-speculative-num-steps: 2                      # steps2/draft3 CONFIRMED on cold pool (2026-09-10 A/B, 2 rounds/arm): C4 agg 437.6/430.8 vs steps3 285.8/200.1 — decisive; C1 noise-band (cold pool eager-adjacent variance), accept len 1.93-2.30 vs 2.35-3.07 but wall-clock wins. was steps3/draft4 (2026-09-08, pre-cold-pool). Backup .bak-steps3-fp8.
+speculative-num-steps: 2   # AB test arm steps2 2026-09-10
 speculative-eagle-topk: 1
-speculative-num-draft-tokens: 3   # paired with steps=2 (arm B); was 4 with steps=3
+speculative-num-draft-tokens: 3   # AB test arm steps2
 speculative-draft-model-quantization: unquant
 speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA)，不影响真实 prefill 批次（仍 triton）；C1/C6 各 +2-4%
 speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec 中文增强热表（与 nvfp4kv 共用同一份 .pt；map hash 进 cache namespace，换表后预热 2-3 轮）
@@ -80,7 +80,7 @@ stream-interval: 1
 watchdog-timeout: 1800
 
 # --- Chat Template (第三方 v22.5, 独立文件不碰原版) ---
-chat-template: ${MODEL_DIR}/chat_template_froggeric_v22.5.jinja
+chat-template: /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4/chat_template_froggeric_v22.5.jinja
 
 # --- Parsers ---
 reasoning-parser: qwen3
@@ -91,7 +91,7 @@ sleep-on-idle: true
 served-model-name: Qwen3.8-Flash-Next-NVFP4
 
 # --- HiCache L2 (pilot re-test 2026-09-06, unified radix tree) ---
-enable-hierarchical-cache: true
+#enable-hierarchical-cache: true   #INCOMPATIBLE with int8 mamba ckpt (upstream fail-fast server_args.py:6333)
 hicache-ratio: 2.0
 hicache-mem-layout: page_first
 hicache-io-backend: kernel
