@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# switch_fp8kv_coldpool.sh — fp8kv scheme round-5: PLE->SSD file backend + expert cold pool (CT112)
-# Modes: plefile | on | off
-#   plefile : unit gains --ple-offload-backend file --ple-offload-dir <nvme> ONLY.
-#             Frees the 64GB pinned PLE table (host RAM prerequisite for cold pool + HiCache).
-#   on      : plefile + PYTHONPATH patch tree + cold-pool env trio (keep330+slots16,
-#             DEBUG/ALPHA parity with live nvfp4kv round-4) + --enable-int8-mamba-checkpoint.
-#   off     : restore unit to .bak-pre-coldpool (pre-round-5), i.e. pinned PLE + no cold pool.
-# YAML is NEVER touched (pool 552,960 / conc4 / steps3 stay as accepted 2026-09-08).
-# Idempotent; backups: .bak-pre-coldpool (unit, first run only).
+# switch_fp8kv_coldpool.sh — fp8kv round-5: expert cold pool (+ optional PLE SSD backend) on CT112
+# Modes:
+#   cold     : PLAN A — patch-tree PYTHONPATH + cold-pool env (keep330/slots16/debug)
+#              + int8 mamba ckpt + HiCache OFF (memory prerequisite: 64 PLE + 24 pool
+#              + 22 hicache would overflow). PLE stays pinned, SSD untouched.
+#   plefile  : PLE -> SSD file backend only (--ple-offload-backend file, nvme1).
+#   on       : PLAN B+ end state = cold + plefile (hicache stays OFF in arm; re-enabling
+#              HiCache 2.0 with PLE on SSD is a post-green tuning step, script stays honest).
+#   off      : strip everything cold/plefile (yaml hicache restored from .bak-pre-coldpool).
+#   restore  : unit file <- .bak-pre-coldpool (pre-round-5 verbatim).
+# YAML backed up once to .bak-pre-coldpool before the first hicache edit.
 set -euo pipefail
 U=/etc/systemd/system/sglang-dealignai-qwen4exp-fp8kv.service
+C=/opt/sglang-config/dealignai-qwen4exp-fp8kv.yaml
 PLEDIR=/mnt/HYV1TBX3_Pro_001173/sglang-cache/ple
 KEEP=/opt/sglang-config/expert_keep_330_final.json
 MODE="${1:-}"
@@ -26,9 +29,8 @@ import re, sys
 u = sys.argv[1]
 s = open(u).read()
 for key in ("SGLANG_EXPERT_KEEP_MASK", "SGLANG_EXPERT_KEEP_OFFLOAD",
-            "SGLANG_EXPERT_COLD_POOL_SLOTS", "SGLANG_COLD_DEBUG",
-            "SGLANG_COLD_STRONG_ALPHA"):
-    s = re.sub(rf"^Environment=?#?{key}=.*\n", "", s, flags=re.M)
+            "SGLANG_EXPERT_COLD_POOL_SLOTS", "SGLANG_COLD_DEBUG"):
+    s = re.sub(rf"^#?Environment={key}=.*\n", "", s, flags=re.M)
 s = s.replace("Environment=PYTHONPATH=/opt/sglang-patch/sglang/python\n", "")
 s = s.replace(" \\\n  --enable-int8-mamba-checkpoint", "")
 open(u, "w").write(s)
@@ -48,12 +50,26 @@ for line in (f"Environment=SGLANG_EXPERT_KEEP_MASK={keep}",
              "Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=16",
              "Environment=SGLANG_COLD_DEBUG=1"):
     key = line.split("=", 1)[0] + "="
-    s = re.sub(rf"^#?{key}.*\n", "", s, flags=re.M)
+    s = re.sub(rf"^#?Environment={key}.*\n", "", s, flags=re.M)
     s = s.replace("Environment=CUDA_HOME=", line + "\nEnvironment=CUDA_HOME=", 1)
 if "--enable-int8-mamba-checkpoint" not in s:
     s = s.replace("--mamba-radix-cache-strategy=extra_buffer_lazy",
                   "--mamba-radix-cache-strategy=extra_buffer_lazy \\\n  --enable-int8-mamba-checkpoint")
 open(u, "w").write(s)
+PY
+}
+
+hicache_off() {
+  [ -f "$C.bak-pre-coldpool" ] || cp "$C" "$C.bak-pre-coldpool"
+  /opt/sglang-env/bin/python3 - "$C" <<'PY'
+import re, sys
+c = sys.argv[1]
+s = open(c).read()
+if "#coldpool-off" not in s:
+    s = re.sub(r"^(enable-hierarchical-cache: true)$",
+               r"#\1   #coldpool-off (plan A: pinned PLE 64 + pool 24 + L2 22 overflows 118GB)", s, flags=re.M)
+open(c, "w").write(s)
+assert "#coldpool-off" in open(c).read(), "hicache disable failed"
 PY
 }
 
@@ -82,6 +98,14 @@ PY
 }
 
 case "$MODE" in
+  cold)
+    [ -f "$U.bak-pre-coldpool" ] || cp "$U" "$U.bak-pre-coldpool"
+    arm_cold
+    hicache_off
+    strip_plefile
+    restart_pair
+    echo "FP8KV-COLD-ARMED (plan A: pinned PLE, HiCache off)"
+    ;;
   plefile)
     [ -f "$U.bak-pre-coldpool" ] || cp "$U" "$U.bak-pre-coldpool"
     arm_plefile
@@ -90,23 +114,26 @@ case "$MODE" in
     ;;
   on)
     [ -f "$U.bak-pre-coldpool" ] || cp "$U" "$U.bak-pre-coldpool"
-    arm_plefile
     arm_cold
+    arm_plefile
+    hicache_off
     restart_pair
-    echo "FP8KV-COLDPOOL-ON-SENT"
+    echo "FP8KV-ON (plan B+ end state: cold pool + PLE on SSD)"
     ;;
   off)
     strip_cold
     strip_plefile
+    [ -f "$C.bak-pre-coldpool" ] && cp "$C.bak-pre-coldpool" "$C"
     restart_pair
-    echo "FP8KV-COLDPOOL-OFF-SENT (ple pinned restored; cold pool inert)"
+    echo "FP8KV-OFF (pinned PLE + HiCache restored; cold pool inert)"
     ;;
   restore)
     cp "$U.bak-pre-coldpool" "$U"
+    [ -f "$C.bak-pre-coldpool" ] && cp "$C.bak-pre-coldpool" "$C"
     restart_pair
-    echo "FP8KV-UNIT-RESTORED"
+    echo "FP8KV-RESTORED-TO-PRE-ROUND5"
     ;;
   *)
-    echo "usage: $0 plefile|on|off|restore"; exit 2
+    echo "usage: $0 cold|plefile|on|off|restore"; exit 2
     ;;
 esac
