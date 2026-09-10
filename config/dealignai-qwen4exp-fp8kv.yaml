@@ -36,7 +36,8 @@ chunked-prefill-size: 4096              # 1024 -> 4096, prefill 吞吐主提升
 
 # --- Scheduler (QSA hybrid) ---
 schedule-policy: lpm
-max-mamba-cache-size: 48                # anchor-slot ladder: 24 starved 3x336K radix reuse (mismatch probe cached=0), 48 for anchor LRU headroom; int8 ckpt auto-sizes 2x
+max-mamba-cache-size: 48                # anchor-slot ladder: 24 starved 3x336K radix reuse, 48 for anchor LRU headroom; int8 ckpt auto-sizes 2x
+mamba-max-states-per-path: 16             # cached0 root fix (same as nvfp4kv 09-11): cap per-path ckpt slots; 3x336K all-miss case belongs to THIS family
 gdn-mtp-cache-mode: none                # T1: skip intermediate h-state caching, reconstruct after verify
 # ReplaySSM 已评估并放弃：上游校验 (server_args.py _handle_linear_replayssm) 要求
 # linear-attn-decode-backend=triton，与 flashinfer GDN decode 互斥；flashinfer 收益已定档，不换。
