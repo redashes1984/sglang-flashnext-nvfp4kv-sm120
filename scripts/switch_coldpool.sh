@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # switch_coldpool.sh — CT112 冷池配置切换器（在 CT112 本机跑）
-# 用法:  ./switch_coldpool.sh eager|graphs|off
+# 用法:  ./switch_coldpool.sh eager|graphs|mtp|off
 #   eager  = Phase-2 判别实验第一道门：冷池开 + decode 图关（30min soak + 探针）
 #   graphs = 第二道门：冷池开 + decode 图恢复 full bs=[1,2,4,6]
+#   mtp    = 第三道门：graphs 基础上重开 NEXTN spec decode（#1M-OFF 行全部解注释）
 #   off    = 回滚：pre-tier 备份 yaml + env 注释（生产原态）
 # 幂等、有备份、每步可回退。绝不手动 sed 生产文件。
 set -euo pipefail
@@ -14,7 +15,7 @@ KEEP=/opt/sglang-config/expert_keep_330_final.json
 SVC=sglang-dealignai-qwen4exp-nvfp4kv
 WARM=sglang-dealignai-nvfp4kv-warmup
 
-MODE=${1:?usage: switch_coldpool.sh eager|graphs|off}
+MODE=${1:?usage: switch_coldpool.sh eager|graphs|mtp|off}
 
 # 先备份当前运行配置（只留最新一份，带时间戳的存档另议）
 if [[ ! -f $BAK ]]; then
@@ -44,7 +45,7 @@ assert "backend: disabled   # coldpool-eager" in s, "decode block rewrite failed
 print("[yaml] decode=disabled, max-total-tokens=1572864")
 PY
     ;;
-  graphs)
+  graphs|mtp)
     grep -q "^Environment=SGLANG_EXPERT_KEEP_MASK=" "$UNIT" || \
       sed -i "/^#Environment=SGLANG_EXPERT_KEEP_MASK=/s/^#//" "$UNIT"
     grep -q "^Environment=SGLANG_EXPERT_KEEP_OFFLOAD=" "$UNIT" || \
@@ -53,6 +54,11 @@ PY
       sed -i "/^Environment=SGLANG_EXPERT_KEEP_OFFLOAD=/a Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=16" "$UNIT"
     # 从 pre-tier 基线恢复（decode 图 bs 块原样回来），再放大 KV 池
     cp $BAK $CFG
+    if [[ "$MODE" == "mtp" ]]; then
+      # 重开 NEXTN：解锁全部 #1M-OFF 行（当年为 1M 腾池关的 spec decode）
+      sed -i "s/^#1M-OFF //" "$CFG"
+      grep -q "^speculative-algorithm: NEXTN" "$CFG" || { echo "[fatal] NEXTN lines missing"; exit 1; }
+    fi
     python3 - "$CFG" <<'PY'
 import sys, re
 p = sys.argv[1]

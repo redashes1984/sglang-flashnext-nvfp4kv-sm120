@@ -52,6 +52,43 @@ def patch_file(path, subs, label):
 # ---------------- 1. topk.py ----------------
 T = f"    {MARK}: runtime expert keep-mask/cold-pool (see layers/moe/expert_cold_pool.py)"
 
+# --- v2.9 UPGRADE pass: rewrite the v2.8 layer_id-only gate into the identity
+# gate BEFORE the pristine-anchor subs run (they then idempotent-skip). MTP
+# draft layers reuse decoder layer_id 0..47 in the SAME process; layer_id-only
+# gating masked+remapped the drafts (accept rate 0.21 on CT112 2026-09-10).
+src_t = open(TOPK).read()
+UPG29 = [
+    ("""    _pre_mask_logits = None
+    if layer_id is not None and _ecp.offload_active():
+        router_logits, _pre_mask_logits = _ecp.apply_keep_mask(layer_id, router_logits)""",
+     """    _pre_mask_logits = None
+    # v2.9 IDENTITY gate: keep the layer_id, but only act when this caller's
+    # TopKConfig was registered by the shrink — MTP draft layers reuse
+    # decoder layer_id 0..47 inside the same process and must stay untouched.
+    _cp_lid = _ecp.is_managed_config(topk_config) if layer_id is not None else None
+    if _cp_lid is not None:
+        router_logits, _pre_mask_logits = _ecp.apply_keep_mask(_cp_lid, router_logits)"""),
+    ("""    if _pre_mask_logits is not None:
+        _k = topk_ids.shape[-1] if topk_ids.dim() > 1 else 1
+        _ecp.stash_demand(layer_id, _pre_mask_logits, recorder_topk_ids, _k)
+    topk_ids = _ecp.remap_topk_ids(layer_id, topk_ids)""",
+     """    if _cp_lid is not None:
+        _k = topk_ids.shape[-1] if topk_ids.dim() > 1 else 1
+        _ecp.stash_demand(_cp_lid, _pre_mask_logits, recorder_topk_ids, _k)
+        topk_ids = _ecp.remap_topk_ids(_cp_lid, topk_ids)"""),
+    ("""        packed_topk = _ecp.remap_packed_ids(layer_id, packed_topk)""",
+     """        if _cp_lid is not None:
+            packed_topk = _ecp.remap_packed_ids(_cp_lid, packed_topk)"""),
+]
+upgraded = 0
+for old28, new29 in UPG29:
+    if old28 in src_t:
+        src_t = src_t.replace(old28, new29, 1)
+        upgraded += 1
+if upgraded:
+    open(TOPK, "w").write(src_t)
+    print(f"[ok] topk v2.8->v2.9 identity-gate upgrade: {upgraded} blocks")
+
 sub_topk = [
     (
         "keep-mask-gate",
@@ -78,8 +115,12 @@ sub_topk = [
     from sglang.srt.layers.moe import expert_cold_pool as _ecp
 
     _pre_mask_logits = None
-    if layer_id is not None and _ecp.offload_active():
-        router_logits, _pre_mask_logits = _ecp.apply_keep_mask(layer_id, router_logits)
+    # v2.9 IDENTITY gate: keep the layer_id, but only act when this caller's
+    # TopKConfig was registered by the shrink — MTP draft layers reuse
+    # decoder layer_id 0..47 inside the same process and must stay untouched.
+    _cp_lid = _ecp.is_managed_config(topk_config) if layer_id is not None else None
+    if _cp_lid is not None:
+        router_logits, _pre_mask_logits = _ecp.apply_keep_mask(_cp_lid, router_logits)
 
     # DeepSeek V2/V3/R1 series models use grouped_top_k""",
     ),
@@ -109,10 +150,10 @@ sub_topk = [
     )
 
 {T} + demand stash + global->slot remap
-    if _pre_mask_logits is not None:
+    if _cp_lid is not None:
         _k = topk_ids.shape[-1] if topk_ids.dim() > 1 else 1
-        _ecp.stash_demand(layer_id, _pre_mask_logits, recorder_topk_ids, _k)
-    topk_ids = _ecp.remap_topk_ids(layer_id, topk_ids)
+        _ecp.stash_demand(_cp_lid, _pre_mask_logits, recorder_topk_ids, _k)
+        topk_ids = _ecp.remap_topk_ids(_cp_lid, topk_ids)
 
     get_global_expert_distribution_recorder().on_select_experts(
         topk_ids=recorder_topk_ids
@@ -129,7 +170,8 @@ old_pack = """    if packed_topk is not None:
         )"""
 new_pack = f"""    if packed_topk is not None:
         {MARK}: packed ids carry global expert ids in the high 16 bits
-        packed_topk = _ecp.remap_packed_ids(layer_id, packed_topk)
+        if _cp_lid is not None:
+            packed_topk = _ecp.remap_packed_ids(_cp_lid, packed_topk)
         return StandardTopKOutputPacked(
             topk_weights, topk_ids, router_logits, packed_topk
         )"""

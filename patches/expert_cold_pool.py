@@ -124,6 +124,8 @@ _BIAS_CACHE = {}    # (layer, dtype) -> persistent bias column (len = full-E = 5
 _REMAP_CACHE = {}   # layer -> persistent remap table (len = full-E)
 _DIRTY = False
 _STASH = {}         # layer -> {"ids","scores"} ring buffers (consume-once)
+_CFG_LIDS = {}      # v2.9: id(topk_config) -> layer_id, ONLY for shrunk target modules
+_CFG_REFS = []      # keeps those TopKConfig objects alive so id() is never recycled
 _STATE = {
     "shrunk": False,       # shrink ran in THIS process (gates ALL runtime hooks)
     "dynamic": False,      # staging active (L3)
@@ -249,6 +251,34 @@ def _return_row(pool, row):
 
 
 # ------------------------------------------------------------------ topk integration
+
+
+def register_managed(module, layer_id, topk_obj=None):
+    """v2.9 IDENTITY GATE — mark exactly the FusedMoE modules this process shrank.
+    MTP/EAGLE draft models reuse decoder layer_id 0..47 in the SAME process
+    (qwen2_moe block's TopK carries layer_id too). A layer_id-only gate would
+    apply the TARGET's keep-bias + physical remap to draft routers: garbage
+    drafts, poisoned demand stats, and remapped ids pointing at wrong GPU rows.
+    select_experts is therefore gated on the TopKConfig OBJECT identity instead.
+    The TopK lives on the PARENT sparse block (sibling of .experts), so callers
+    pass it via topk_obj when the shrunk FusedMoE module has no own .topk."""
+    tk = getattr(module, "topk", None) if getattr(module, "topk", None) is not None else topk_obj
+    cfg = getattr(tk, "topk_config", None)
+    if cfg is None:
+        raise RuntimeError(
+            f"[COLD-POOL] layer {layer_id}: no topk.topk_config on the shrunk module "
+            "or its owner block — the identity gate cannot be armed; refusing "
+            "(shrunk pool + ungated router would remap every id blindly)"
+        )
+    _CFG_LIDS[id(cfg)] = int(layer_id)
+    _CFG_REFS.append(cfg)  # pin the object so its id() can never be recycled
+
+
+def is_managed_config(topk_config):
+    """layer_id of a registered target TopKConfig, or None (draft/other model)."""
+    if not _STATE["shrunk"] or topk_config is None:
+        return None
+    return _CFG_LIDS.get(id(topk_config))
 
 
 def apply_keep_mask(layer_id, router_logits):
@@ -464,6 +494,22 @@ def maybe_shrink_after_process(model):
 
     slots = cold_slots()
     shrunk, total_host = 0, 0
+    # v2.9 identity gate: FusedMoE has no own .topk — TopK lives on the parent
+    # sparse block (Qwen2MoeSparseMoeBlock.topk, sibling of .experts). Map each
+    # FusedMoE to the unique sibling TopK in its direct parent container.
+    def _owner_topk(mm):
+        for parent in model.modules():
+            for attr in dir(parent):
+                try:
+                    v = getattr(parent, attr)
+                except Exception:
+                    continue
+                if v is mm:
+                    tk = getattr(parent, "topk", None)
+                    if tk is not None and getattr(tk, "topk_config", None) is not None:
+                        return tk
+        return None
+
     for m in model.modules():
         if not isinstance(m, FusedMoE):
             continue
@@ -557,6 +603,7 @@ def maybe_shrink_after_process(model):
         # num_local_experts metadata must agree with the physical pool
         m.num_local_experts = pool.phys
         build_tables(layer_id, keep, len(cold_ids), slots, E, dev)
+        register_managed(m, layer_id, topk_obj=_owner_topk(m))  # v2.9 identity gate
         _STATE["layers"][int(layer_id)] = pool
         total_host += pool.host_bytes()
         shrunk += 1

@@ -50,6 +50,9 @@ def make_layer(E=32, keep=20, slots=4, K=64, N=32):
     m.g2_alphas = torch.nn.Parameter(torch.rand(E), requires_grad=False)
     m.w13_input_scale_quant = torch.nn.Parameter(torch.tensor(1.5), requires_grad=False)  # 0-d
     m.num_local_experts = E
+    # v2.9: real Qwen2MoeSparseMoeBlock carries self.topk.topk_config — the
+    # identity gate registers on it, so the fake must have it too.
+    m.topk = types.SimpleNamespace(topk_config=types.SimpleNamespace(top_k=10))
     # alias hazard: w13_blockscale_swizzled is the SAME object as w13_weight_scale
     m.w13_blockscale_swizzled = m.w13_weight_scale
     m.w2_blockscale_swizzled = m.w2_weight_scale
@@ -316,6 +319,46 @@ def test_cold_probe_breaks_mask_starvation():
     check(24 not in pool.gid_row, "out-of-band cold gid 24 must not be staged by the probe")
 
 
+def test_identity_gate_draft_layers():
+    """T9 v2.9: MTP draft reuses decoder layer_id 0..47 in the SAME process —
+    gate must follow TopKConfig OBJECT identity, not layer_id. CT112 evidence:
+    accept rate 0.21 with drafts silently masked+remapped by target tables."""
+    print("[T9] identity gate neutered for unregistered (draft) topk configs")
+    had = ecp._STATE["shrunk"]
+    ecp._STATE["shrunk"] = True
+    ecp._CFG_LIDS.clear(); ecp._CFG_REFS.clear()
+
+    class Cfg: pass
+    target_mod = types.SimpleNamespace(topk=types.SimpleNamespace(topk_config=Cfg()))
+    draft_cfg = Cfg()  # draft block's own config object, never registered
+    ecp.register_managed(target_mod, 0)
+    check(ecp.is_managed_config(target_mod.topk.topk_config) == 0,
+          "registered target config resolves to its layer")
+    check(ecp.is_managed_config(draft_cfg) is None,
+          "draft config (same layer_id namespace, unregistered) is NOT managed")
+    # id-recycling hazard: without the _CFG_REFS pin, a dead cfg's id() could be
+    # handed to a fresh draft object and silently resolve as managed.
+    tmp = Cfg()
+    ecp.register_managed(types.SimpleNamespace(topk=types.SimpleNamespace(topk_config=tmp)), 7)
+    tid = id(tmp)
+    del tmp
+    forged = Cfg()
+    check(ecp.is_managed_config(forged) is None or id(forged) != tid,
+          "pinned refs prevent id()-collision with a dead registered config")
+    # missing topk attr must FAIL LOUD (shrunk pool + blind router = corruption)
+    try:
+        ecp.register_managed(types.SimpleNamespace(), 3)
+        check(False, "missing .topk must raise")
+    except RuntimeError:
+        check(True, "register_managed refuses modules without topk_config")
+    # pre-shrink: nothing resolves (warmup/draft-before-target safe)
+    ecp._STATE["shrunk"] = False
+    check(ecp.is_managed_config(target_mod.topk.topk_config) is None,
+          "pre-shrink everything unmanaged (offload_active-equivalent)")
+    ecp._STATE["shrunk"] = had
+    ecp._CFG_LIDS.clear(); ecp._CFG_REFS.clear()
+
+
 def main():
     test_shrink_and_stage()
     test_remap_fn()
@@ -325,6 +368,7 @@ def main():
     test_bias_dtype_sync_all_columns()
     test_inventory_gate()
     test_cold_probe_breaks_mask_starvation()
+    test_identity_gate_draft_layers()
     print()
     if FAIL:
         print(f"RESULT: {len(FAIL)} FAILURES")
