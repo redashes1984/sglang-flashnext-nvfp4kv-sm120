@@ -56,9 +56,9 @@ cuda-graph-config:
 
 # --- Speculative decoding NEXTN (migrated from systemd) ---
 speculative-algorithm: NEXTN
-speculative-num-steps: 3
+speculative-num-steps: 2                      # steps2/draft3 CONFIRMED on cold pool (2026-09-10 A/B, 2 rounds/arm): C4 agg 437.6/430.8 vs steps3 285.8/200.1 — decisive; C1 noise-band (cold pool eager-adjacent variance), accept len 1.93-2.30 vs 2.35-3.07 but wall-clock wins. was steps3/draft4 (2026-09-08, pre-cold-pool). Backup .bak-steps3-fp8.
 speculative-eagle-topk: 1
-speculative-num-draft-tokens: 4
+speculative-num-draft-tokens: 3   # paired with steps=2 (arm B); was 4 with steps=3
 speculative-draft-model-quantization: unquant
 speculative-attention-mode: decode   # verify/draft 走 decode 注意力路径(trtllm_mha/XQA)，不影响真实 prefill 批次（仍 triton）；C1/C6 各 +2-4%
 speculative-token-map: /opt/sglang-config/frspec_map_64k.pt   # FR-Spec 中文增强热表（与 nvfp4kv 共用同一份 .pt；map hash 进 cache namespace，换表后预热 2-3 轮）

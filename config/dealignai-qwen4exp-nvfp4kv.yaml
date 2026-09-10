@@ -37,7 +37,7 @@ chunked-prefill-size: 4096
 
 # --- Scheduler (QSA hybrid) ---
 schedule-policy: lpm
-max-mamba-cache-size: 48                  # conc12 x 4 slots/req (spec mode) = 48 strict
+max-mamba-cache-size: 64                # conc12 x 4/req CONSTANT + 16 anchor slack (fp8kv cached0 lesson, G2X gate 2026-09-10: 3x233K all-hit 0.5s, C12 608 tok/s no regression; int8 ckpt auto 128 slots 3.74GB, avail 5.29GB)
 gdn-mtp-cache-mode: none
 
 # --- Mamba / GDN ---
