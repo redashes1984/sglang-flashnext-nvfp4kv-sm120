@@ -13,7 +13,7 @@
 set -euo pipefail
 U=/etc/systemd/system/sglang-dealignai-qwen4exp-fp8kv.service
 C=/opt/sglang-config/dealignai-qwen4exp-fp8kv.yaml
-PLEDIR=/mnt/HYV1TBX3_Pro_001173/sglang-cache/ple
+PLEDIR=/mnt/GLOWAY_YCT2TNVMe_202732/sglang-cache/ple   # PCIe4.0 nvme0 (4.5GB/s); HYV1TBX3 is PCIe3.0 (2.4GB/s) — dimin corrected 2026-09-10
 KEEP=/opt/sglang-config/expert_keep_330_final.json
 MODE="${1:-}"
 
@@ -75,9 +75,9 @@ PY
 
 arm_plefile() {
   mkdir -p "$PLEDIR"
-  /opt/sglang-env/bin/python3 - "$U" <<'PY'
+  /opt/sglang-env/bin/python3 - "$U" "$PLEDIR" <<'PY'
 import re, sys
-u = sys.argv[1]
+u, pledir = sys.argv[1], sys.argv[2]
 s = open(u).read()
 # idempotency must ignore comment lines: an explanatory comment mentioning
 # --ple-offload-dir would otherwise short-circuit the arm forever.
@@ -85,7 +85,7 @@ active = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
 if "--ple-offload-dir" not in active:
     s = re.sub(r"(--ple-offload-embedding)(?!.*--ple-offload-backend)",
                r"\1 --ple-offload-backend file "
-               r"--ple-offload-dir /mnt/HYV1TBX3_Pro_001173/sglang-cache/ple", s, count=1)
+               r"--ple-offload-dir " + pledir, s, count=1)
 # The upstream attr-100 gate is GB10-only. This x86 box reads pageable host
 # memory through the IOMMU (attr 88=1, attr 100=0) and the production gather
 # kernel was functionally verified against malloc + file-mmap pointers
