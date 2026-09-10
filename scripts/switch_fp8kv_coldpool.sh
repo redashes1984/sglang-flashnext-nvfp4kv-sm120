@@ -65,11 +65,15 @@ hicache_off() {
 import re, sys
 c = sys.argv[1]
 s = open(c).read()
-if "#coldpool-off" not in s:
-    s = re.sub(r"^(enable-hierarchical-cache: true)$",
-               r"#\1   #coldpool-off (plan A: pinned PLE 64 + pool 24 + L2 22 overflows 118GB)", s, flags=re.M)
+# comment out an ACTIVE enable-hierarchical-cache (any trailing note); tolerate
+# lines already commented by earlier rounds (they carry their own reasons).
+s = re.sub(r"^enable-hierarchical-cache: true(.*)$",
+           r"#enable-hierarchical-cache: true\1   #coldpool-off", s, flags=re.M)
 open(c, "w").write(s)
-assert "#coldpool-off" in open(c).read(), "hicache disable failed"
+active = [l for l in open(c).read().splitlines()
+          if l.strip() and not l.lstrip().startswith("#")
+          and "enable-hierarchical-cache" in l]
+assert not active, f"hicache disable failed: {active}"
 PY
 }
 
@@ -105,6 +109,7 @@ u = sys.argv[1]
 s = open(u).read()
 s = re.sub(r" --ple-offload-backend file --ple-offload-dir \S+", "", s)
 s = re.sub(r"^Environment=SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1\n", "", s, flags=re.M)
+s = re.sub(r"^Environment=SGLANG_QWEN4_PLE_FILE_RSS_BUDGET_GB=\d+(\.\d+)?\n", "", s, flags=re.M)
 open(u, "w").write(s)
 PY
 }
