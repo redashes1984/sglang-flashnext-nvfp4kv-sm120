@@ -16,8 +16,8 @@
 | 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | 768K（YaRN ×3） | 1M（YaRN ×4 显式） | **1M（YaRN ×4 显式）** |
 | KV 池 | 552,960 | 786,432 | 851,968（回收 mamba 槽 +64K） | 1,179,648（为 int8 ckpt 池腾资 + 启动余量后） | **2,359,296**（keep330+16 冷池腾出 ~30GB 显存 → +118 万 token） |
 | 并发 | 4 | 6 | 6 | 6 | **12**（spec 下 mamba 4 槽/请求 → 48 槽） |
-| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s（热态） | **≈146–171 tok/s**（spec-on + 冷池在线） |
-| 解码聚合 | ≈355–365 tok/s（C6） | ~409 tok/s（C6） | ≈550–575 tok/s（C6） | ≈72–91 tok/s（C6） | **≈773–825 tok/s（C12）** |
+| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s（热态） | **≈122–129 tok/s**（spec-on steps=2 + 冷池在线；2026-09-10 预热后验收 bench） |
+| 解码聚合 | ≈355–365 tok/s（C6） | ~409 tok/s（C6） | ≈550–575 tok/s（C6） | ≈72–91 tok/s（C6） | **≈704–710 tok/s（C12，同 harness）** |
 | Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s（冷前缀；radix 命中更高） | **≈9.7K tok/s**（冷前缀；radix 命中更高） |
 | MTP（NEXTN）steps | 3 | 2 | 2（校准甜点） | OFF（1M 单卡下 steps≥1 即 OOM） | **开，steps=2**（冷池腾出的显存重新养得起投机） |
 | GPU 常驻路由专家 | 全部 512 | 全部 512 | 全部 512 | 全部 512 | **346/512**（330 keep + 16 动态槽；166 个冷专家进 24.15 GB pinned 内存，按需求搬运） |
@@ -79,8 +79,8 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 |---|---|
 | 搬运正确性 | 8448 行 host↔GPU 校验逐字节一致，eager 与 CUDA graph 双态通过；soak 全程零 MISMATCH / stage_fail / CUDA error |
 | 搬运活跃度 | 30 分钟 soak：staged 4997、h2d 13.82 GB；强制 alpha 证明：staged 1618 / evicted 850 |
-| 解码 C1 | **146–171 tok/s**（对比 graphs-only 无投机 104–105、第三轮 spec-off 75–90） |
-| 解码 C12 聚合 | **773–825 tok/s**，accept len 2.15–2.27 |
+| 解码 C1 | **122–129 tok/s** 预热后验收 bench（steps=2/draft3）。对比：steps=1 约 116、纯 graphs 无投机 104–105。浅投机 A/B 推翻过"steps=1 免费省 2.8GB"的判断——steps2 的 accept len 2.07–2.31 压过 steps1 的 1.74–1.79，故 steps=2 保持默认，steps=1 降级为显存告急时的应急档 |
+| 解码 C12 聚合 | **704–710 tok/s**（同一 harness 两轮独立采样；早先 773–825 出自热缓存窗口，已废弃） |
 | KV 池余量 | 冷池 OFF 对照在 1,572,864 直接 **OOM** → keep330+16 正是解锁池子的钥匙；2,359,296 启动后 torch-avail 7.1 GB，12×66K 长文压测峰值 92,694/97,887 MiB、真实围栏仍留 5.1 GB，零 OOM/retract |
 | 主机内存 | 112 GB 机器上：冷池 pinned 24.15 GB + PLE 表 64 GB —— soak 末 MemAvailable ~20 GB，swap 稳定 |
 
@@ -223,11 +223,11 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 
 ## 约束与诚实声明
 
-- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第四轮现役：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 48 / KV 池 2,359,296 / decode CG bs[1,2,4,6,8,10,12]。** 第四轮热态：C1 ≈146–171 / C12 聚合 ≈773–825 / prefill ≈9.7K（冷前缀）。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
+- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第四轮现役：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 48 / KV 池 2,359,296 / decode CG bs[1,2,4,6,8,10,12]。** 第四轮热态：C1 ≈122–129 / C12 聚合 ≈704–710 / prefill ≈9.7K（冷前缀）——预热后验收 bench（steps=2/draft3），取代早先热缓存窗口的 146–171 / 773–825。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
 - 定档 fp8kv 栈（同日）：可移植项已移植（见 §fp8kv 方案）、steps 保持 3、HiCache 开、conc4 / YaRN×2 512K / KV 池 552,960、FR-Spec 热表共用。热态：C1≈165 / C6≈355–365 / accept len≈2.08–2.50。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
 - 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4-5 分钟（第四轮多 ~3.5 分钟权重加载 + 收缩）。unit 故意不 enable，避免开机抢 GPU。
 - 第四轮主机内存预算是刻意压到极限的：冷池 pinned 24.15 GB + PLE 表 pinned 64 GB（47.7 GB 被 2 的幂取整 —— `file` 后端 A/B 已调研、暂缓）压在 112 GB 机器上 → soak 末 MemAvailable ~20 GB。再要挂任何 pinned 消费者之前先看 `Shmem` 与 swap。
-- 冷池 + 投机的 C1（≈146–171）已经追平 fp8kv（≈165）—— 第三轮"fp4 KV 更慢"的差距主要是 spec-off 税，不全是 gather-dequant。上游原生 fp4 QSA 解码池（#37798）是继续拉开差距的路。
+- 冷池 + 投机的 C1（≈122–129）已逼近但略低于 fp8kv（≈165）—— 第三轮"fp4 KV 更慢"的差距主要是 spec-off 税，不全是 gather-dequant。上游原生 fp4 QSA 解码池（#37798）是追平或反超的路。
 - 实验 unit 用 `Restart=no` 是故意的 —— 崩溃保留现场，不循环重启。
 - 所有数字来自单张 RTX PRO 6000（96 GB）、sglang `0.5.19.dev6+g78c5024e` + 本地补丁。SM121/GB10 是另一个故事（参考 gabrielolympie 关于该架构长上下文静默腐坏的记录）。
 - 更换 FR-Spec 热表会一次性重置 prefix cache namespace —— 换表后预热 2–3 轮再上真实流量。

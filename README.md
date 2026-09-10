@@ -16,8 +16,8 @@ Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpez
 | Context | 512K (YaRN ×2) | 768K (YaRN ×3) | 768K (YaRN ×3) | 1M (YaRN ×4 explicit) | **1M (YaRN ×4 explicit)** |
 | KV pool | 552,960 | 786,432 | 851,968 (+64K reclaimed mamba slots) | 1,179,648 (after funding int8 ckpt pool + boot headroom) | **2,359,296** (keep330+16 cold pool frees ~30 GB VRAM → +1.18M tokens) |
 | Concurrency | 4 | 6 | 6 | 6 | **12** (mamba 48 slots = 4/req under spec) |
-| Decode C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s warm-state | **≈146–171 tok/s** (spec-on, cold pool live) |
-| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | ≈72–91 tok/s | **≈773–825 tok/s** at C12 |
+| Decode C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s warm-state | **≈122–129 tok/s** (spec-on steps=2, cold pool live; post-warmup acceptance bench 2026-09-10) |
+| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | ≈72–91 tok/s | **≈704–710 tok/s** at C12 (same acceptance harness) |
 | Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s fresh-prefix; higher on radix hits | **≈9.7K tok/s** fresh-prefix; higher on radix hits |
 | MTP (NEXTN) steps | 3 | 2 | 2 (calibrated sweet spot) | OFF (steps≥1 OOMs at 1M on one GPU) | **ON, steps=2** (cold pool's freed VRAM funds spec again) |
 | Routed experts on GPU | all 512 | all 512 | all 512 | all 512 | **346/512** (330 keep + 16 dynamic slots; 166 cold experts in 24.15 GB pinned host, demand-staged) |
@@ -79,8 +79,8 @@ Measured on the live stack (cold pool ON + decode graphs + NEXTN steps=2, conc 1
 |---|---|
 | Staging correctness | 8448-row host↔GPU checksum byte-exact, under eager **and** CUDA graphs; zero MISMATCH / stage_fail / CUDA error across soaks |
 | Staging activity | 30-min soak: staged 4997, h2d 13.82 GB; forced-alpha proof: staged 1618 / evicted 850 |
-| Decode C1 | **146–171 tok/s** (vs 104–105 graphs-only no-spec, vs 75–90 round-3 spec-off) |
-| Decode C12 aggregate | **773–825 tok/s**, accept len 2.15–2.27 |
+| Decode C1 | **122–129 tok/s** post-warmup acceptance bench, steps=2/draft3 (vs ~116 steps=1 and 104–105 graphs-only no-spec — shallow-MTP A/B falsified the "free 2.8 GB at no cost" reading: steps2 wins accept len 2.07–2.31 vs 1.74–1.79, so steps=2 stays default and steps=1 is demoted to a memory-pressure fallback) |
+| Decode C12 aggregate | **704–710 tok/s** (two independent runs on the same harness; earlier 773–825 figures came from warm-cache windows and are superseded) |
 | KV pool headroom | OFF-control at 1,572,864 **OOMs** → keep330+16 is what unlocks the pool; 2,359,296 boots with 7.1 GB torch-avail, 12×66K long-context stress peaks at 92,694/97,887 MiB with 5.1 GB real fence left, zero OOM/retract |
 | Host RAM | pinned 24.15 GB cold pool + 64 GB PLE table on a 112 GB box — MemAvailable ~20 GB at soak end, swap stable |
 
@@ -230,11 +230,11 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
-- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-4 live state: cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 48 / KV pool 2,359,296 / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈146–171 / C12 aggregate ≈773–825 / prefill ≈9.7K fresh-prefix. Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
+- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-4 live state: cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 48 / KV pool 2,359,296 / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
 - Finalized fp8kv stack (same date): portable items ported (§The fp8kv scheme), steps kept 3, HiCache ON, conc4 / YaRN×2 512K / KV pool 552,960, FR-Spec map shared. Hot-state: C1≈165 / C6≈355–365 / accept len≈2.08–2.50. Rollback = its own `config/baseline/` pair over the current files.
 - Single consumer GPU + 44 GB pinned PLE table: the nvfp4kv and fp8kv schemes are mutually exclusive; expect ~4-5 min cold start (round 4 adds ~3.5 min weight load + shrink). The unit deliberately ships unenabled to avoid boot-time GPU contention.
 - Round-4 host-RAM budget is tight by design: 24.15 GB cold-pool pins + 64 GB PLE pinned table (power-of-two rounded from 47.7 GB — a `file`-backend A/B is deferred) on a 112 GB box → MemAvailable ~20 GB under soak. Watch `Shmem` and swap before adding any more pinned consumers.
-- C1 decode with the cold pool + spec (≈146–171) now matches fp8kv (≈165) — the round-3 "fp4 KV is slower" gap was mostly the spec-off tax, not gather-dequant alone. Upstream native fp4 QSA decode pools (#37798) remain the path to widen the lead.
+- C1 decode with the cold pool + spec (≈122–129) sits just below fp8kv (≈165) — the round-3 "fp4 KV is slower" gap was mostly the spec-off tax, not gather-dequant alone. Upstream native fp4 QSA decode pools (#37798) remain the path to close or invert the gap.
 - `Restart=no` on the experiment unit is deliberate — preserve the crash scene.
 - Numbers are from one RTX PRO 6000 (96 GB), sglang `0.5.19.dev6+g78c5024e` + local patches. SM121/GB10 is a different story (see gabrielolympie's notes on silent long-context corruption there).
 - Swapping the FR-Spec token map resets the prefix-cache namespace once — warm 2–3 rounds after any table change.
