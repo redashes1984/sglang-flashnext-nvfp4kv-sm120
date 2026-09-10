@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import nullcontext
 from typing import Any, Iterable, Optional, Set, Tuple
 
@@ -67,8 +68,12 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
+    ple_fingerprint,
+    ple_msync,
+    ple_sidecar_is_valid,
+    ple_sidecar_path,
+    ple_sidecar_write,
 )
-from sglang.srt.layers.moe import expert_tier
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import logger
 
@@ -829,17 +834,59 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self.quant_method = None
 
         source_weight = embedding.weight
+        # Each TP rank holds a different vocabulary shard of the same shape.
+        tag = (
+            f"rows{self.shard_indices.org_vocab_start_index}"
+            f"-{self.shard_indices.org_vocab_end_index}"
+        )
         host_table = allocate_ple_host_table(
             shape=source_weight.shape,
             dtype=source_weight.dtype,
             backend=backend,
             table_dir=table_dir,
-            # Each TP rank holds a different vocabulary shard of the same shape.
-            tag=(
-                f"rows{self.shard_indices.org_vocab_start_index}"
-                f"-{self.shard_indices.org_vocab_end_index}"
-            ),
+            tag=tag,
         )
+        # B+ skip-if-valid: when the file-backed table was already sealed from
+        # these exact checkpoint files, the loader may skip the 47.7 GiB
+        # rewrite entirely (NVMe wear + boot latency). Any drift -> rewrite and
+        # re-seal. Only the file backend has a persistent artifact to trust.
+        self._ple_sidecar = None
+        self._ple_skip_load = False
+        self._ple_rows_written = 0
+        if backend == "file":
+            try:
+                from sglang.srt.server_args import get_global_server_args
+
+                model_path = get_global_server_args().model_path
+                table_file = getattr(host_table, "_sglang_ple_file_path", None)
+                if model_path and table_file:
+                    sidecar = ple_sidecar_path(os.path.dirname(table_file), tag)
+                    fps = ple_fingerprint(model_path)
+                    nbytes = (
+                        int(host_table.numel()) * host_table.element_size()
+                    )
+                    if fps and ple_sidecar_is_valid(
+                        sidecar,
+                        table_file,
+                        nbytes,
+                        tuple(source_weight.shape),
+                        str(source_weight.dtype),
+                        fps,
+                        model_path,
+                    ):
+                        self._ple_skip_load = True
+                        logger.info(
+                            "PLE table: sidecar valid for %s -> skipping table "
+                            "rewrite (%.1f GiB)",
+                            table_file,
+                            nbytes / 2**30,
+                        )
+                    else:
+                        self._ple_sidecar = (sidecar, fps, model_path, nbytes)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "PLE skip-if-valid unavailable (%s); rewriting table", exc
+                )
         # Only the file backend has anything to prefetch (rows live on storage).
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only it needs its resident set bounded: a fault maps a whole
@@ -1926,6 +1973,16 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 return False
             emb = ple_mod.ngram_embedding
             if (
+                isinstance(emb, Qwen4ExpPinnedHostEmbedding)
+                and getattr(emb, "_ple_skip_load", False)
+            ):
+                # B+ skip-if-valid: the file-backed table was sealed from these
+                # exact checkpoint files (see the wrapper __init__). Mark the
+                # param loaded so post-load verification stays quiet, and do
+                # not touch the mapping -- zero writes, zero page dirtying.
+                loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
+                return True
+            if (
                 loaded_weight.dtype == torch.float8_e4m3fn
                 and emb.weight.dtype != torch.float8_e4m3fn
             ):
@@ -1973,6 +2030,10 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             actual_rows = loaded_weight.shape[0]
             shard_end = shard_start + actual_rows
             copy_ple_rows_to_tp_embedding(emb, loaded_weight, shard_start, shard_end)
+            if isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                emb._ple_rows_written = getattr(emb, "_ple_rows_written", 0) + int(
+                    actual_rows
+                )
             loaded_shard_params.add(f"{mod_prefix}.ngram_embedding.weight")
             return True
 
@@ -2166,7 +2227,43 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
             if isinstance(module, Qwen3_5GatedDeltaNet):
                 module.finalize_fused_in_proj()
 
-        expert_tier.setup_expert_tiers(self)
+        # B+ : seal freshly written tables so the next boot can skip the
+        # rewrite. Only after every row of this rank's window provably landed
+        # -- a partial load must never produce a valid-looking sidecar.
+        for ple_mod in ple_modules.values():
+            emb = ple_mod.ngram_embedding
+            if not isinstance(emb, Qwen4ExpPinnedHostEmbedding):
+                continue
+            pending = getattr(emb, "_ple_sidecar", None)
+            if pending is None:
+                continue
+            sidecar, fps, model_path, nbytes = pending
+            expected = int(getattr(emb, "num_embeddings_per_partition", 0))
+            written = int(getattr(emb, "_ple_rows_written", 0))
+            if written < expected:
+                logger.warning(
+                    "PLE table: only %d/%d rows loaded this boot -- not "
+                    "sealing (next boot rewrites)",
+                    written,
+                    expected,
+                )
+                continue
+            try:
+                if not ple_msync(emb.weight):
+                    logger.warning("PLE table: msync failed; skipping seal")
+                    continue
+                ple_sidecar_write(
+                    sidecar,
+                    nbytes,
+                    tuple(emb.weight.shape),
+                    str(emb.weight.dtype),
+                    fps,
+                    model_path,
+                )
+                logger.info("PLE table: sealed sidecar %s", sidecar)
+            except OSError as exc:
+                logger.warning("PLE table: seal failed (%s); not sealed", exc)
+
         return loaded_params
 
     @classmethod

@@ -79,11 +79,22 @@ arm_plefile() {
 import re, sys
 u = sys.argv[1]
 s = open(u).read()
-if "--ple-offload-dir" not in s:
+# idempotency must ignore comment lines: an explanatory comment mentioning
+# --ple-offload-dir would otherwise short-circuit the arm forever.
+active = "\n".join(l for l in s.splitlines() if not l.lstrip().startswith("#"))
+if "--ple-offload-dir" not in active:
     s = re.sub(r"(--ple-offload-embedding)(?!.*--ple-offload-backend)",
                r"\1 --ple-offload-backend file "
                r"--ple-offload-dir /mnt/HYV1TBX3_Pro_001173/sglang-cache/ple", s, count=1)
+# The upstream attr-100 gate is GB10-only. This x86 box reads pageable host
+# memory through the IOMMU (attr 88=1, attr 100=0) and the production gather
+# kernel was functionally verified against malloc + file-mmap pointers
+# (test_pageable_gather.py: both byte-exact). Skip the over-strict check.
+if "SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK" not in active:
+    s = s.replace("[Service]\n", "[Service]\nEnvironment=SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1\n", 1)
 open(u, "w").write(s)
+act2 = "\n".join(l for l in open(u).read().splitlines() if not l.lstrip().startswith("#"))
+assert "--ple-offload-dir" in act2 and "SKIP_DEVICE_CHECK" in act2, "plefile arm failed"
 PY
 }
 
@@ -93,6 +104,7 @@ import re, sys
 u = sys.argv[1]
 s = open(u).read()
 s = re.sub(r" --ple-offload-backend file --ple-offload-dir \S+", "", s)
+s = re.sub(r"^Environment=SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK=1\n", "", s, flags=re.M)
 open(u, "w").write(s)
 PY
 }
