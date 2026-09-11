@@ -62,6 +62,9 @@ re-run it after any base-tree sync.
 
 - `config/expert_keep_330_final.json` md5 `bd8d6abb7bde8bab937db9887fdc58da`
 - `scripts/frspec_map_64k.pt` md5 `49f23b7fb5a30459e10c817e1e76b1c5` (+ manifest for provenance)
+- QSA-patched base files: created/verified by running the patcher; spot-check
+  `layers/attention/qsa_nvfp4_kv.py` (live md5 `1197e264dfdd8b27e037c4f6a7dc7718`)
+  and sampler guard marker `dspark-37962` in `layers/sampler.py` (both trees carry 0001).
 - Model weights: `RadixArk`-lineage `dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4`
   — re-download from HF; record a sha256 ledger per-file into the shared-disk
   MODEL_CARD before serving.
@@ -71,3 +74,17 @@ re-run it after any base-tree sync.
 - HF download credentials / model license acceptance (site-specific).
 - The 24.15 GB cold-pool pin + 64 GB PLE pin need a ≥112 GB host **with the same
   overcommit discipline**; see README §Constraints before sizing down.
+
+## Frozen-state archive on the deployment host (2026-09-11 cleanup)
+
+All intermediate `.bak-*` litter (units, YAMLs, src-tree files, probe .out logs,
+model-dir config backups) was deleted after this kit landed; the repo + git
+history is the single source of truth. One rollup backup remains:
+
+`CT112:/root/backups/sglang-frozen-round5-20260911.tar.gz`
+sha256 `80d88f36893ef4eac69f8c84ce80814234304ab7fd8ef7b4a14eb983cf1223ab`
+(14 entries: both YAMLs, all 4 units, keep-mask, FR-Spec map, both warmups,
+expert_cold_pool.py — all md5-verified against the repo. Probe outputs are not
+archived: their numbers live in README §Fifth round and the git log). Out of
+scope and untouched: the 17 `vllm-*.bak` unit files on the same box (different
+project).

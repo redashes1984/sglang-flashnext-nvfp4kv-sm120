@@ -86,7 +86,7 @@ fp8kv frozen state (in-repo YAML+unit): conc4 / YaRN×2 512K / **steps=2** (roun
 
 ## Full restore on a fresh same-hardware box
 
-`bootstrap/MANIFEST.md` is the authoritative checklist: base tarball + sha256, pip lock, ninja shim, chat template, per-file md5 table for the 7-file overlay delta (models/qwen4_exp.py, qwen4_exp_ple_table.py, model_executor/model_runner.py, layers/moe/topk.py, layers/moe/expert_cold_pool.py, mem_cache/mamba_checkpoint_pool.py, mem_cache/memory_pool.py — `runtime-src/` holds the exact live bytes; the diff-vs-clean-tree list there is complete and verified 2026-09-11). Order: env lock → base tarball build + patcher/0001 → overlay + 0002 → cold-pool deploy → configs/units/shim/template → start → verify step 6. The repo is the backup: frozen remote state == `git checkout 426dd2e` or later.
+`bootstrap/MANIFEST.md` is the authoritative checklist: base tarball + sha256, pip lock, ninja shim, chat template, per-file md5 table for the 7-file overlay delta (models/qwen4_exp.py, qwen4_exp_ple_table.py, model_executor/model_runner.py, layers/moe/topk.py, layers/moe/expert_cold_pool.py, mem_cache/mamba_checkpoint_pool.py, mem_cache/memory_pool.py — `runtime-src/` holds the exact live bytes; the diff-vs-clean-tree list there is complete and verified 2026-09-11). Order: env lock → base tarball build + patcher/0001 → overlay + 0002 → cold-pool deploy → configs/units/shim/template → start → verify step 6. The repo is the backup: frozen remote state == git HEAD ≥ `df987bc` (live YAMLs md5-verified against repo same day; intermediate `.bak-*` on the box deleted 2026-09-11, rollup tarball `CT112:/root/backups/sglang-frozen-round5-20260911.tar.gz` sha256 `80d88f36…` in MANIFEST).
 
 ## Pitfalls checklist
 

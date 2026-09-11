@@ -7,7 +7,7 @@
 #   mamba 24 = radix ON 入场费（峰值 usage 0.62 ≈20 槽）+ 余量钉死；32 是未钉制的自动 sizing 结果，多余槽为死显存
 #   与 fp8kv 方案互斥（单 GPU + PLE pinned 44GB），同时只跑一个；本 unit 故意不 enable，防开机抢 GPU
 #   性能账本(2026-09-08 终版 GDN=flashinfer双端 + mamba24/KV851968 + prefill CG=full + FR-Spec表cov1.0 + MTP steps2/draft3 + ABL=extra_buffer_lazy + SAM=decode, 可复现热态)：C1≈136 t/s / C6≈550-575 t/s / prefill≈10K t/s / accept len≈2.0-2.3 rate≈0.5-0.66 / mamba峰值≤12槽 / KV池851968;注:EAGLE×FP4下prefill批次部分走eager(#28386);换表重置prefix cache namespace需预热2-3轮;MTP校准steps2为甜点;ABL收益在并发(C6+38%),单流微亏(-3%);SAM=decode再补C1/C6各~2-4%,accept分布不变;mamba-radix-cache-strategy为别名键只能走CLI flag
-#   定档(2026-09-08): 基线备份=yaml .bak-gdnpre-20260907-223437 / unit .bak-specv2-20260908-000843; 回滚=cp 基线覆盖后 systemctl restart
+#   定档(2026-09-11 round5): 回滚锚点=仓库 config/baseline/ 对 + CT112:/root/backups/sglang-frozen-round5-20260911.tar.gz（中间态 .bak 已清理，仓库 git 历史即演进记录）
 # --- Network ---
 host: 0.0.0.0
 port: 8000
