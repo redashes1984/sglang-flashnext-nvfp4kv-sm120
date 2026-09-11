@@ -171,8 +171,9 @@ patches/
 config/
   dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 第五轮定档（容量兜底，停机待命）：conc12 / 1M /
                                     spec ON steps=2 / mamba64 + 每路径帽 16 /
-                                    KV 池 2477312（09-11：2,359,296×1.05 防溢出余量，页对齐；
-                                    +0.82 GB，fence→~4.47 GB —— 下次 nvfp4 开机生效）/ int8 ckpt ON（128 槽）/
+                                    KV 池 2202048（09-11 晚：×1.05 池 2,477,312 实炸——late-load kernel
+                                    税实测 4.25 GB，free 4.39→0.14；按棣民定 ≥2,202,010
+                                    向上页对齐 2,202,048；boot fence 6.42，缴税后 ≥1.9 GB）/ int8 ckpt ON（128 槽）/
                                     冷池 keep330+16 /
                                     decode CG bs[1,2,4,6,8,10,12] / prefill CG intent=full
                                     （09-11 与 fp8kv 统一意图声明；spec/EAGLE 在线期间上游
@@ -327,7 +328,7 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 
 ## 约束与诚实声明
 
-- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第五轮定档栈（第六轮起 nvfp4kv 转为兜底待机）：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / 每路径 ckpt 帽 16（int8 池 128 槽）/ KV 池 2,477,312（原 2,359,296，×1.05 防溢出余量，下次开机生效，+0.82 GB、fence→~4.47 GB）/ decode CG bs[1,2,4,6,8,10,12]。** 热态：C1 ≈122–129 / C12 聚合 ≈704–710 / prefill ≈9.7K（冷前缀）——预热后验收 bench（steps=2/draft3），取代早先热缓存窗口的 146–171 / 773–825。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
+- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第五轮定档栈（第六轮起 nvfp4kv 转为兜底待机）：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / 每路径 ckpt 帽 16（int8 池 128 槽）/ KV 池 2,202,048（第五轮 2,359,296 经 ×1.05→2,477,312 于 09-11 实炸：4.25 GB late-load kernel 税吃穿 fence；回缩至 2,202,048=棣民定 2,202,010 向上页对齐——boot fence 6.42 GB、缴税稳态 ≥1.9 GB）/ decode CG bs[1,2,4,6,8,10,12]。** 热态：C1 ≈122–129 / C12 聚合 ≈704–710 / prefill ≈9.7K（冷前缀）——预热后验收 bench（steps=2/draft3），取代早先热缓存窗口的 146–171 / 773–825。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
 - 定档 fp8kv 栈（第六轮，现役）：可移植项已移植（见 §fp8kv 方案）、MTP steps=2（第四轮 A/B）、HiCache 关（int8 ckpt fail-fast）、conc **8** / **YaRN×4 1M** / **KV 池 1,651,520 = (1×1M + 2×256K) × 1.05 防溢出余量**（池 ≈20.3 GB，**capture 后 fence 实测 4.00 GB** —— 回退触发线 <2.5 GB → 砍 decode CG 桶到 [1,2,4,6]）/ mamba 48 + 帽 16 / 专家冷池 / **QSA split-K**（1M 冷灌 TTFT 133s）。2×1M 双开已否决：需 25.77 GB，拆墙后 fence 剩 1.75 GB 属走钢丝。NIAH@1M 背书：**PASS**（第六轮开机验证，chat 端点 + `enable_thinking=false`）。当前现役；nvfp4kv 停机作 conc-12 兜底。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
 - 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4-5 分钟（第四轮多 ~3.5 分钟权重加载 + 收缩）。unit 故意不 enable，避免开机抢 GPU。
 - 第四轮主机内存预算是刻意压到极限的：冷池 pinned 24.15 GB + PLE 表 pinned 64 GB（47.7 GB 被 2 的幂取整 —— `file` 后端 A/B 已调研、暂缓）压在 112 GB 机器上 → soak 末 MemAvailable ~20 GB。再要挂任何 pinned 消费者之前先看 `Shmem` 与 swap。

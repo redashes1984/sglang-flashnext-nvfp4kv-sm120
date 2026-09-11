@@ -29,7 +29,11 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 2477312                  # 09-11 决策: 2,359,296(恰=9×256K,零余量) × 1.05 防溢出 = 2,477,260.8 → 64页对齐 2,477,312（+118,016 tok slack ≈ 每会话 9.8K 生成余量）。nvfp4 几何实测 6,969 B/token（boot 16.44GB/池）→ 成本 +0.82GB，fence 5.29→~4.47GB 仍安全。下次 nvfp4 bring-up 生效
+max-total-tokens: 2202048                  # 09-11 晚 棣民定 ≥2202010→向上页对齐 2202048;
+                                          # 2477312 实炸: late-load kernel 税 4.25GB
+                                          # (free 4.39→0.14, 21:17 冷灌+708MB 分配 OOM
+                                          # SIGKILL); 本值回收 1.79GB → 稳态 free ≈1.9GB
+                                          # 旧注释: 2,359,296(恰=9×256K,零余量) × 1.05 防溢出 = 2,477,260.8 → 64页对齐 2,477,312（+118,016 tok slack ≈ 每会话 9.8K 生成余量）。nvfp4 几何实测 6,969 B/token（boot 16.44GB/池）→ 成本 +0.82GB，fence 5.29→~4.47GB 仍安全。下次 nvfp4 bring-up 生效
 context-length: 1048576                    # YaRN x4; override in json-model-override-args
 max-running-requests: 12
 max-prefill-tokens: 16384

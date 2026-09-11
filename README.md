@@ -173,9 +173,12 @@ patches/
 config/
   dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — ROUND 5 FROZEN (current): conc12 /
                                     1M / spec ON steps=2 / mamba64 + per-path ckpt cap 16 /
-                                    KV pool 2477312 (09-11: 2,359,296×1.05 overflow slack,
-                                    page-aligned; +0.82 GB, fence→~4.47 GB — applies on
-                                    next nvfp4 bring-up) / int8 mamba checkpoint ON (128 slots) /
+                                    KV pool 2202048 (09-11 night: the ×1.05 pool 2,477,312
+                                    OOM-crashed — late-load Triton kernel tax measured
+                                    at 4.25 GB, free fell 4.39→0.14; rescinded to
+                                    DiMin's ≥2,202,010 → page-ceil 2,202,048; fence
+                                    6.42 at boot, ≥1.9 GB after kernel tax) /
+                                    int8 mamba checkpoint ON (128 slots) /
                                     cold pool keep330+16 /
                                     decode CG bs[1,2,4,6,8,10,12] / prefill CG intent=full
                                     (09-11 unified with fp8kv; while spec/EAGLE is live the
@@ -337,7 +340,7 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
-- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-5 frozen stack (nvfp4kv standby since round 6): cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / per-path ckpt cap 16 (int8 pool 128 slots) / KV pool 2,477,312 (was 2,359,296; ×1.05 overflow slack pending on next bring-up, +0.82 GB, fence→~4.47 GB) / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
+- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-5 frozen stack (nvfp4kv standby since round 6): cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / per-path ckpt cap 16 (int8 pool 128 slots) / KV pool 2,202,048 (round-5's 2,359,296 got ×1.05→2,477,312 which OOM-crashed live on 09-11: 4.25 GB late-load kernel tax ate the fence; rescinded to 2,202,048 = page-ceil of DiMin's 2,202,010 — boot fence 6.42 GB, settled ≥1.9 GB post-tax) / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
 - Finalized fp8kv stack (round 6, LIVE): portable items ported (§The fp8kv scheme), MTP steps=2 (round-4 A/B), HiCache OFF (int8-ckpt fail-fast), conc **8** / **YaRN×4 1M** / **KV pool 1,651,520 = (1×1M + 2×256K) × 1.05 overflow slack** (pool ≈20.3 GB, **fence 4.00 GB measured post-capture** — rollback trigger <2.5 GB → trim decode CG buckets to [1,2,4,6]) / mamba 48 + cap 16 / expert cold pool / **QSA split-K** (1M cold TTFT 133 s). 2×1M co-existence rejected: needs 25.77 GB, would fence-strike at 1.75 GB. NIAH@1M endorsement: **PASS** (round-6 bring-up, chat endpoint + `enable_thinking=false`). Currently live; nvfp4kv stopped as conc-12 fallback. Rollback = its own `config/baseline/` pair over the current files.
 - Single consumer GPU + 44 GB pinned PLE table: the nvfp4kv and fp8kv schemes are mutually exclusive; expect ~4-5 min cold start (round 4 adds ~3.5 min weight load + shrink). The unit deliberately ships unenabled to avoid boot-time GPU contention.
 - Round-4 host-RAM budget is tight by design: 24.15 GB cold-pool pins + 64 GB PLE pinned table (power-of-two rounded from 47.7 GB — a `file`-backend A/B is deferred) on a 112 GB box → MemAvailable ~20 GB under soak. Watch `Shmem` and swap before adding any more pinned consumers.
