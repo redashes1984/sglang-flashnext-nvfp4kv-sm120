@@ -27,5 +27,15 @@ echo "== mem =="
 grep -E "^(Shmem|MemAvailable):" /proc/meminfo | awk '{printf "%-12s %7.1f GB\n", substr($1,1,11), $2/1048576}'
 free -h | tail -1
 echo "== quality probes =="
-/opt/sglang-env/bin/python3 /opt/sglang-test/probe_cp.py 2>&1 | head -6
+# explicit failure path (R4 item 4): missing env/python or missing probe file
+# must NOT silently degrade the acceptance run.
+QRC=0
+if [ ! -x /opt/sglang-env/bin/python3 ] && [ ! -e /opt/sglang-env/bin/python3 ]; then
+  echo "QUALITY-PROBE SKIP: /opt/sglang-env/bin/python3 missing"; QRC=1
+elif [ ! -f /opt/sglang-test/probe_cp.py ]; then
+  echo "QUALITY-PROBE SKIP: /opt/sglang-test/probe_cp.py missing"; QRC=1
+else
+  /opt/sglang-env/bin/python3 /opt/sglang-test/probe_cp.py 2>&1 | head -6 || QRC=1
+fi
 echo FINAL-SOAK-DONE
+exit $QRC

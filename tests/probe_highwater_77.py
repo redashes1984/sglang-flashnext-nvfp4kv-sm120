@@ -4,19 +4,50 @@ bench A used 文档段落 template, ~336K ctxs, 77% pool fill -> cached=0 twice.
 All hit experiments were at <=60% fill. This replicates EXACT template,
 re-ask text and fill ratio (3 x ~605K on 2.36M = 77%) on the final-state
 service (pinned, mamba64). Hit -> water level is not the culprit.
+
+Evidence chain (R4 item 1/2): reask readings cross-check meta_info.cached_tokens
+against journal "#cached-token:" located via this run's unique marker; single
+missing source => INCONCLUSIVE instead of FAIL. Marker inside prompt tail line.
 """
-import json, sys, time, urllib.request
+import json, os, re, subprocess, sys, time, urllib.request
+
+MARK = os.environ.get("A2_MARK") or f"a2mk-{int(time.time())}-{os.urandom(3).hex()}"
+SVC = "sglang-dealignai-qwen4exp-nvfp4kv"
 
 def gen(text, mx=8):
     req = urllib.request.Request("http://127.0.0.1:8000/generate", data=json.dumps({
-        "text": text, "sampling_params": {"temperature": 0.0, "max_new_tokens": mx}}).encode(),
+        "text": text + f" [{MARK}]", "sampling_params": {"temperature": 0.0, "max_new_tokens": mx}}).encode(),
         headers={"Content-Type": "application/json"})
     t0 = time.time()
     r = json.loads(urllib.request.urlopen(req, timeout=900).read())
     return time.time() - t0, r.get("meta_info", {})
 
-def log(*a):
-    print(*a, flush=True)
+def log(*a): print(*a, flush=True)
+
+def journal_stats(key, pat):
+    txt = None
+    try:
+        if os.environ.get("HERMES_JOURNAL_FILE"):
+            txt = open(os.environ["HERMES_JOURNAL_FILE"]).read()
+        else:
+            txt = subprocess.run(["journalctl", "-u", SVC, "--no-pager"],
+                                 capture_output=True, text=True, timeout=30).stdout
+    except Exception as exc:
+        print(f"[journal unavailable: {exc}]")
+        txt = ""
+    blocks = re.split(r"(?m)^.*" + re.escape(MARK) + r".*$", txt or "")
+    nums = re.findall(pat, blocks[-1]) if len(blocks) > 1 else []
+    return [float(n) for n in nums]
+
+def cached_pair(mi):
+    meta = mi.get("cached_tokens")
+    jrn = journal_stats("cached", r"#cached-token:\s*([0-9]+)")
+    jv = jrn[0] if jrn else None
+    if meta is None or jv is None:
+        verdict = "INCONCLUSIVE"
+    else:
+        verdict = "consistent" if abs(meta - jv) <= 8 else "MISMATCH"
+    return meta, jv, verdict
 
 def make_ctx(m, n):   # EXACT bench template
     line_tpl = "文档段落{m}-{i}：本报告记录系统状态与测试结论，涉及网络与存储。"
@@ -27,7 +58,8 @@ cA, cB, cC = make_ctx("AA", N), make_ctx("BB", N), make_ctx("CC", N)
 t, m = gen(cA + "\n锚点A的编号是什么？只答编号。", 16); log(f"A1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
 t, m = gen(cB + "\n锚点B的编号是什么？只答编号。", 16); log(f"B1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
 t, m = gen(cC + "\n锚点C的编号是什么？只答编号。", 16); log(f"C1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
-t, m = gen(cA + "\n锚点A的编号是什么？只答编号。", 16); log(f"A2 reask={t:.1f}s cached={m.get('cached_tokens')}")
-t, m = gen(cB + "\n锚点B的编号是什么？只答编号。", 16); log(f"B2 reask={t:.1f}s cached={m.get('cached_tokens')}")
-t, m = gen(cC + "\n锚点C的编号是什么？只答编号。", 16); log(f"C2 reask={t:.1f}s cached={m.get('cached_tokens')}")
+for tag, txt in (("A2", cA), ("B2", cB), ("C2", cC)):
+    t, m = gen(txt + "\n锚点" + tag[0] + "的编号是什么？只答编号。", 16)
+    meta, jrn, verdict = cached_pair(m)
+    log(f"{tag} reask={t:.1f}s cached_meta={meta} cached_journal={jrn} verdict={verdict}")
 log("HIGHWATER-DONE")
