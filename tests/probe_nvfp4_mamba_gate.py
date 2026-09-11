@@ -21,7 +21,7 @@ Run AFTER switch to mamba 64, with cold pool + graphs ON.
 import json, os, re, subprocess, sys, time, urllib.request
 
 URL = "http://127.0.0.1:8000/generate"
-SVC = "sglang-dealignai-qwen4exp-nvfp4kv"
+SVC = os.environ.get("SGLANG_SVC", "sglang-dealignai-qwen4exp-nvfp4kv")
 MARK = os.environ.get("A2_MARK") or f"a2mk-{int(time.time())}-{os.urandom(3).hex()}"
 
 def gen(text, mx=8, timeout=900):

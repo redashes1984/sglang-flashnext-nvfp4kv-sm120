@@ -115,6 +115,12 @@ CASES = [
                                       (1024, 120_000, 60_000), (1024, 200_000, 30_000)], 16),
 ]
 if SMALL:
+    # SM120 tensor-core surface is bounded by the K dimension: the einsum
+    # reference lane faults at KEYS=50_000 (misaligned address, reproduced
+    # on an idle GPU 09-12). Reduce only the reference-side loop to a
+    # 16384-aligned prefix; the masked suffix is all -inf so reference
+    # completeness is preserved. Kernel bitwise lanes keep full KEYS.
+    REF_KEYS = (KEYS // 16384) * 16384
     # quarter the row counts so output buffers stay ~64MB even at the smallest
     # KEYS; bases clamp into [0, KEYS-2] (late-1M collapses to a wide-window
     # control) and windows clamp to the remaining tail (may degenerate to

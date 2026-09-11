@@ -12,7 +12,7 @@ missing source => INCONCLUSIVE instead of FAIL. Marker inside prompt tail line.
 import json, os, re, subprocess, sys, time, urllib.request
 
 MARK = os.environ.get("A2_MARK") or f"a2mk-{int(time.time())}-{os.urandom(3).hex()}"
-SVC = "sglang-dealignai-qwen4exp-nvfp4kv"
+SVC = os.environ.get("SGLANG_SVC", "sglang-dealignai-qwen4exp-nvfp4kv")
 
 def gen(text, mx=8):
     req = urllib.request.Request("http://127.0.0.1:8000/generate", data=json.dumps({
