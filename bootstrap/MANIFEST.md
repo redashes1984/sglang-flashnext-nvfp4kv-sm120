@@ -11,7 +11,7 @@ alone. Verify each hash before trusting a restored file.
   Humanize and Kernel Design Agent (#36845)". No third-party fork needed.
 - Source tarball: `https://github.com/sgl-project/sglang/archive/78c5024e9.tar.gz`
   sha256 `25a9af10ee3a0b4a3173e074b26b07789b4ec1aa64c9c4241bf168533f33c68e`
-- Gold-standard verified on this date: `apply_nvfp4_patches.py` + `0001` + `0002`
+- Gold-standard verified on this date: `apply_nvfp4_patches.py` + `0001` + `0002` (+ 2026-09-11: `mqa_splitk.py` appended after the qsa patcher — verified byte-exact md5 reproduction on a pristine copy)
   (with `-p2`) + cold-pool deploy all apply ALL-green on the clean tarball tree.
 - Build for SM120: `CUDAARCHS=120 TORCH_CUDA_ARCH_LIST="12.0"`, editable install
   into `/opt/sglang-env` (see pip lock below).
@@ -50,6 +50,7 @@ these exact files must match the hashes; anything else in the tree is a lie.
 | `model_executor/model_runner.py` | `32e773e0111c9b305e30417c2d4648a8` | deploy_expert_cold_pool.py |
 | `models/qwen4_exp.py` | `8aada4a8416447a87ad8781e2a9f27fb` | (runtime-src snapshot) |
 | `models/qwen4_exp_ple_table.py` | `b788ee8fcb2969bb525cb0617c1d801f` | (runtime-src snapshot) |
+| `layers/attention/qsa/mqa.py` | `d04fb0a5a90a06579b159cfde4411d68` | patches/mqa_splitk.py (run AFTER qsa patcher; idempotent marker `split: int = 1`; rollback anchor `mqa.py.bak-mqasplit` md5 `813f5d65…` = pristine 78c5024e9) |
 | `mem_cache/mamba_checkpoint_pool.py` | `ccc608bb3faa7ac9dc253380af32db52` | patch 0002 |
 | `mem_cache/memory_pool.py` | `90b27aad2ed8e2829a95ce968cfb47eb` | patcher + patch 0002 |
 
