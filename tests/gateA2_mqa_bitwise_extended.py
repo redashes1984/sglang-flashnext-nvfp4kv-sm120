@@ -1,16 +1,33 @@
-"""Gate A2: EXTENDED bitwise equality split=64 vs split=1 — full shape lattice.
+"""Gate A2+: extended bitwise equality split=64 vs split=1 — full shape lattice,
+PLUS torch reference comparison (audit R2-2 closure, 2026-09-12).
 
-Covers the shape classes gate A missed (early chunks with budget-full rows,
-multi-request interleaved windows = the split-boundary stress case, degenerate
-edges). Production shapes only (heads=4 dim=128 compressed kv_heads=1).
+The split-vs-split self-consistency check can only catch CTA write races — it
+cannot see a systematic layout bug shared by both lanes. This version adds an
+independent torch fp32 reference (relu-head-max-sum semantics + mask, mirroring
+kernel source mqa.py:185-215) on every lattice case.
+
+Tolerance rationale: kernel accumulates in fp32 with tilelang gemm (clear_accum
++ max(0) per head); torch ref uses broadcast matmul in fp32. Expected drift is
+last-ulp only → rtol=1e-3, atol=1e-2 is generous yet would still flag a real
+layout/indexing bug (those produce O(sqrt(DIM))-scale garbage, not 1e-2).
+
+Reference is row-chunked (256 rows) so extra GPU memory stays ~256MB/case —
+runnable alongside a live service inside the ~1.9GB settled fence. Run the full
+lattice in the next maintenance window for the record; the lite subset
+(REF_ONLY=1 env → small-row cases) is safe to run any time.
 """
-import sys, math
+import sys, os, math
 sys.path.insert(0, "/opt/sglang-patch/sglang/python")
 import torch
 import sglang.srt.layers.attention.qsa.mqa as mqa
 
-KEYS = 250_244
 HEADS, DIM = 4, 128
+# SMALL=1: reduced lattice (KEYS=50K, <=512 rows/case, ~150MB peak) so the
+# reference lane can run ALONGSIDE the live service inside its settled fence.
+# Full-lattice bitwise must wait for a maintenance window (4096-row cases
+# need ~4GB buffers the live GPU cannot spare).
+SMALL = os.environ.get("SMALL") == "1"
+KEYS = 50_000 if SMALL else 250_244
 
 def logits(rows_spec, seed, split_override):
     """rows_spec: list of (count, base_offset, win) interleaved segments.
@@ -51,7 +68,38 @@ def logits(rows_spec, seed, split_override):
         del buf
     out.div_(math.sqrt(DIM))
     mqa._tilelang_qsa_mqa_mask_kernel()(out, starts, ends)
-    return out
+    return out, starts, ends
+
+def reference(out, q, k, starts, ends):
+    """Independent torch fp32 ref of relu-sum-over-heads MQA logits + mask.
+    Row-chunked at 256 to cap extra memory (~256MB) beside a live service."""
+    kb = k[:, 0].float()                      # [KEYS, DIM]
+    inv = 1.0 / math.sqrt(DIM)
+    st = starts.long(); en = ends.long()
+    cols = torch.arange(KEYS, device=out.device)
+    # chunk=32: einsum temp [32,HEADS,KEYS] fp32 = 128MB; mask compare materializes
+    # ~2x [chunk,KEYS] bool+fp32 — total <300MB on top of the 1GB kernel output.
+    for rs in range(0, out.shape[0], 32):
+        re_ = min(rs + 32, out.shape[0])
+        qc = q[rs:re_].float()                # [n, HEADS, DIM]
+        # scores[r,h,k] = q[r,h,:] @ k[k,:]  -> max(0) -> sum(h)
+        s = torch.einsum("rhd,kd->rhk", qc, kb).clamp_(min=0.0)
+        ref = s.sum(dim=1).mul_(inv)          # [n, KEYS]
+        del s
+        cols = torch.arange(KEYS, device=out.device)
+        m = (cols < st[rs:re_].unsqueeze(1)) | (cols >= en[rs:re_].unsqueeze(1))
+        ref.masked_fill_(m, float("-inf"))
+        if not torch.allclose(out[rs:re_], ref, rtol=1e-3, atol=1e-2,
+                              equal_nan=True):
+            bad = ~(torch.isclose(out[rs:re_], ref, rtol=1e-3, atol=1e-2,
+                                  equal_nan=True))
+            r0, c0 = bad.nonzero()[0].tolist()
+            print(f"   REF-DIFF rows[{rs}+{r0}] col{c0}: "
+                  f"kernel={out[rs+r0, c0].item():.4f} ref={ref[r0, c0].item():.4f}",
+                  flush=True)
+            return False
+        del ref
+    return True
 
 CASES = [
     # (name, rows_spec, seed)
@@ -66,19 +114,46 @@ CASES = [
     ("multi-batch 4x1024",           [(1024, 5_000, 120_000), (1024, 60_000, 90_000),
                                       (1024, 120_000, 60_000), (1024, 200_000, 30_000)], 16),
 ]
-fails = 0
+if SMALL:
+    # quarter the row counts so output buffers stay ~64MB even at the smallest
+    # KEYS; bases clamp into [0, KEYS-2] (late-1M collapses to a wide-window
+    # control) and windows clamp to the remaining tail (may degenerate to
+    # win=0 rows — both lanes must agree on fully-masked output there).
+    def _fit(c, b, w):
+        b = max(0, min(b, KEYS - 2))
+        return (max(1, c // 4), b, min(w, KEYS - 2 - b))
+    CASES = [(n, [_fit(c, b, w) for c, b, w in spec], sd) for n, spec, sd in CASES]
+# SKIP_SPLIT=1: reference-only mode — skip split=1/32 re-runs and determinism
+# re-computation (halves kernel work per case; memory was already bounded by
+# the 256-row reference chunking). Use when running beside a live service.
+fails = ref_fails = 0
 for name, spec, seed in CASES:
     try:
-        a = logits(spec, seed, 64)
-        a2 = logits(spec, seed, 64)
-        det = torch.equal(a, a2)   # temporal determinism: catches overlapping-CTA
-        del a2                     # write races (the silent-rot failure mode)
+        a, st, en = logits(spec, seed, 64)
+        # rebuild the exact same inputs for the reference lane
+        rows = sum(c for c, _, _ in spec)
+        torch.manual_seed(seed)
+        dev = "cuda"
+        q = torch.randn(rows, HEADS, DIM, device=dev, dtype=torch.bfloat16)
+        k = torch.randn(KEYS, 1, DIM, device=dev, dtype=torch.bfloat16)
+        ok_ref = True
+        if not os.environ.get("SKIP_REF"):
+            ok_ref = reference(a, q, k, st, en)
+            if not ok_ref:
+                ref_fails += 1
+        del k
         torch.cuda.empty_cache()
-        b = logits(spec, seed, 1)
+        if os.environ.get("SKIP_SPLIT"):
+            print(f"{name}: reference-checked (split lanes skipped)", flush=True)
+            del a, q
+            continue
+        b, _, _ = logits(spec, seed, 1)
+        a2, _, _ = logits(spec, seed, 64)
+        det = torch.equal(a, a2)  # temporal determinism (same-seed re-run)
         eq = torch.equal(a, b) and det
-        # split=32 cross-check on the two fattest cases
-        if "budget" in name or "multi-batch" in name:
-            c = logits(spec, seed, 32)
+        del a2
+        if "budget" in name or "multi-batch" in name:  # split=32 cross-check
+            c, _, _ = logits(spec, seed, 32)
             eq32 = torch.equal(a, c)
             del c
             eq = eq and eq32
@@ -88,10 +163,13 @@ for name, spec, seed in CASES:
             idx = (a != b).nonzero()[:5]
             for r, c in idx.tolist():
                 print(f"   diff@[{r},{c}] s64={a[r,c].item()} s1={b[r,c].item()}")
-        print(f"{name}: bitwise-equal={eq}", flush=True)
-        del a, b
+        print(f"{name}: bitwise-equal={eq} (ref-ok={ok_ref}, det={det})", flush=True)
+        del a, b, q
     except Exception as e:
         fails += 1
         print(f"{name}: EXC {str(e)[:90]}", flush=True)
     torch.cuda.empty_cache()
-print("GATE-A2:", "PASS bitwise" if fails == 0 else f"FAIL {fails}", flush=True)
+verdict = fails == 0 and ref_fails == 0
+print("GATE-A2+:", "PASS bitwise+reference" if verdict else
+      f"FAIL bitwise={fails} reference={ref_fails}", flush=True)
+sys.exit(0 if verdict else 1)

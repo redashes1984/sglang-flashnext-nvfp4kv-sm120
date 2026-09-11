@@ -46,7 +46,7 @@ these exact files must match the hashes; anything else in the tree is a lie.
 | File (under `sglang/python/sglang/srt/`) | md5 (live + repo `runtime-src/`) | Produced by |
 |---|---|---|
 | `layers/moe/topk.py` | `d150f8fde0a68d681d70c341ba201603` | deploy_expert_cold_pool.py (5 anchors) |
-| `layers/moe/expert_cold_pool.py` | `e891bd62aa6261e1e3be6a588d008fc7` | copy patches/expert_cold_pool.py |
+| `layers/moe/expert_cold_pool.py` | `6d17690934bfcfb1587f2db88b52141f` | copy patches/expert_cold_pool.py (round-7: remap fused-shared clamp, audit R1-🟡1 fix; staged on CT112 09-12, takes effect on next restart — pre-clamp rollback anchor `.bak-preclamp` md5 `e891bd62aa6261e1e3be6a588d008fc7`) |
 | `model_executor/model_runner.py` | `32e773e0111c9b305e30417c2d4648a8` | deploy_expert_cold_pool.py |
 | `models/qwen4_exp.py` | `8aada4a8416447a87ad8781e2a9f27fb` | (runtime-src snapshot) |
 | `models/qwen4_exp_ple_table.py` | `b788ee8fcb2969bb525cb0617c1d801f` | (runtime-src snapshot) |
