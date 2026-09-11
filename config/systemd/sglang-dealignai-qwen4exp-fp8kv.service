@@ -8,7 +8,6 @@ Type=simple
 User=root
 Group=root
 WorkingDirectory=/root
-
 # 启动参数全部在 YAML (2026-09-07 迁移完成); unit 仅剩 YAML 合并器不支持的两项:
 #   --ple-offload-embedding (BooleanOptionalAction) / --mamba-radix-cache-strategy
 #   (DeprecatedAliasStoreAction dest 污染, YAML 写规范名会被误判 unsupported)
@@ -16,14 +15,18 @@ ExecStart=/opt/sglang-env/bin/sglang serve \
   --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --config /opt/sglang-config/dealignai-qwen4exp-fp8kv.yaml \
   --ple-offload-embedding \
-  --mamba-radix-cache-strategy=extra_buffer_lazy
-
-
+  --mamba-radix-cache-strategy=extra_buffer_lazy \
+  --enable-int8-mamba-checkpoint \
+  --mamba-max-states-per-path 16
 Restart=on-abnormal
 RestartSec=30
-
 # 环境变量
+Environment=PYTHONPATH=/opt/sglang-patch/sglang/python
 Environment=PATH=/opt/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=SGLANG_EXPERT_KEEP_MASK=/opt/sglang-config/expert_keep_330_final.json
+Environment=SGLANG_EXPERT_KEEP_OFFLOAD=1
+Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=16
+Environment=SGLANG_COLD_DEBUG=1
 Environment=CUDA_HOME=/usr/local/cuda
 Environment=PYTHONUNBUFFERED=1
 Environment=CUDA_VISIBLE_DEVICES=0
@@ -34,14 +37,11 @@ Environment=PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 Environment=SGLANG_SM120_LOWM_FP8_WEIGHT=1
 Environment=SGLANG_SM120_LM_HEAD_FP8=1
 Environment=SGLANG_ENABLE_SM120_LOWM_BF16_GEMM=1
-
 # 资源限制
 LimitNOFILE=65536
 LimitNPROC=4096
-
 # 日志
 StandardOutput=journal
 StandardError=journal
-
 [Install]
 WantedBy=multi-user.target

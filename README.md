@@ -2,28 +2,28 @@
 
 English | **[简体中文](README_zh.md)**
 
-**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. Both shipped schemes are fully tuned: `nvfp4kv` (`--kv-cache-dtype nvfp4`, current mainline; the live instance runs the round-4 expert-cold-pool state) and `fp8kv` (`fp8_e4m3`, the rollback scheme, carrying the portable half of the same tuning). Each keeps its pre-tuning baseline under `config/baseline/` as rollback anchor and before/after evidence.**
+**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. Both shipped schemes are fully tuned: `nvfp4kv` (`--kv-cache-dtype nvfp4`, current mainline; the live instance runs the round-5 frozen stack: expert cold pool + per-path checkpoint cap) and `fp8kv` (`fp8_e4m3`, the rollback scheme, carrying the portable half of the same tuning). Each keeps its pre-tuning baseline under `config/baseline/` as rollback anchor and before/after evidence.**
 
 Upstream sglang could not run NVFP4 *KV cache* together with Qwen Sparse Attention (QSA): the Triton gather path receives packed fp4 buffers and dies on `KeyError: 'float4_e2m1fn_x2'`. This repo ships the working fix (a port of the [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) patch, MIT, adapted for the SM120 trtllm-gen sparse-decode path that dspark's SM121 build never reaches), plus everything we learned tuning the result: a sampler OOM fix ([#37962](https://github.com/sgl-project/sglang/issues/37962)-class), the HiCache hard constraint, radix-cache economics under fp4 KV, and a full speculative-decoding steps calibration.
 
 Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) and [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) — both fp8-KV; **this repo is the nvfp4-KV datapoint** they don't have.
 
-## Results (stack generations: baseline → round-2 tuned → nvfp4kv-1m trial → expert cold pool)
+## Results (stack generations: baseline → round-2 tuned → nvfp4kv-1m trial → expert cold pool → round-5 freeze)
 
-| | fp8kv scheme | baseline nvfp4kv | tuned nvfp4kv (round 2) | nvfp4kv-1m trial (round 3) | **expert cold pool (round 4, live)** |
+| | fp8kv scheme | baseline nvfp4kv | tuned nvfp4kv (round 2) | nvfp4kv-1m trial (round 3) | **frozen stack (round 4 cold pool + round 5 cache fixes, live)** |
 |---|---|---|---|---|---|
 | KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | nvfp4 | nvfp4 | **nvfp4** |
 | Context | 512K (YaRN ×2) | 768K (YaRN ×3) | 768K (YaRN ×3) | 1M (YaRN ×4 explicit) | **1M (YaRN ×4 explicit)** |
 | KV pool | 552,960 | 786,432 | 851,968 (+64K reclaimed mamba slots) | 1,179,648 (after funding int8 ckpt pool + boot headroom) | **2,359,296** (keep330+16 cold pool frees ~30 GB VRAM → +1.18M tokens) |
-| Concurrency | 4 | 6 | 6 | 6 | **12** (mamba 48 slots = 4/req under spec) |
+| Concurrency | 4 | 6 | 6 | 6 | **12** (mamba 64 = 4/req × 12 + 16 anchor slack) |
 | Decode C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s warm-state | **≈122–129 tok/s** (spec-on steps=2, cold pool live; post-warmup acceptance bench 2026-09-10) |
 | Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | ≈72–91 tok/s | **≈704–710 tok/s** at C12 (same acceptance harness) |
 | Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s fresh-prefix; higher on radix hits | **≈9.7K tok/s** fresh-prefix; higher on radix hits |
 | MTP (NEXTN) steps | 3 | 2 | 2 (calibrated sweet spot) | OFF (steps≥1 OOMs at 1M on one GPU) | **ON, steps=2** (cold pool's freed VRAM funds spec again) |
 | Routed experts on GPU | all 512 | all 512 | all 512 | all 512 | **346/512** (330 keep + 16 dynamic slots; 166 cold experts in 24.15 GB pinned host, demand-staged) |
-| Int8 mamba ckpt pool | — | — | — | ON (patch 0002 × PLE mirrors, PR #38619) | **ON** (96 slots, 2.81 GB at conc12) |
-| Radix prefix reuse | on | on | on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix | on | **on** |
-| HiCache L2 | **on** (safe under fp8) | off | off | off (mandatory under fp4 KV, see Constraints) | **off** (mandatory under fp4 KV, see Constraints) |
+| Int8 mamba ckpt pool | — | — | — | ON (patch 0002 × PLE mirrors, PR #38619) | **ON** (128 slots / 3.74 GB; per-path cap `mamba-max-states-per-path 16`, round 5) |
+| Radix prefix reuse | on | on | on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix | on | **on** — 2×549K long chains coexist, re-ask 0.9 s full hit (round 5) |
+| HiCache L2 | **off** (fail-fast vs int8 mamba ckpt, `server_args.py:6333`) | off | off | off (mandatory under fp4 KV, see Constraints) | **off** (mandatory under fp4 KV, see Constraints) |
 
 Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6×107K concurrent pool pressure, post-eviction prefix re-query correctness, grammar JSON ×6, tool calls, zero retractions, zero errors. Round-4 adds: 8448-row staging checksum byte-exact under CUDA graphs, 30-min acceptance soaks, 12×66K long-context concurrent stress — zero MISMATCH / stage_fail / OOM. Accept-len ≈2.0–2.6, accept-rate ≈0.5–0.8.
 
@@ -41,6 +41,7 @@ The tuned version differs from the baseline snapshot (`config/baseline/`) on eig
 | 6 | FR-Spec speculative token map: none → **self-built 64K hot table** (`speculative-token-map: frspec_map_64k.pt`, coverage 1.0) | Draft acceptance improved by seeding from our own corpus (obsidian notes + skill files → 65,536 IDs); map hash enters the cache namespace so old prefixes are auto-isolated | accept len ≈2.0 → 2.0–2.3; caveat: one-time prefix-cache namespace reset after swapping the table (warm 2–3 rounds) |
 | 7 | MTP steps: 3 → **2** (with draft=3/topk=1) | steps=3's accept-rate gain doesn't pay for the linear dequant cost under fp4 KV; measured steps=3: C1 drops to ~133–135, accept rate noisy 0.29–0.62 | steps=2 is the sweet spot; carried into baseline too but re-verified here |
 | 8 | *(round-3 layer)* int8 mamba checkpoint pool: OFF (upstream ValueError-guarded against PLE side states) → **ON** via patch 0002 PLE mirrors | At 1M ctx the BF16 ckpt slots are the memory frontier; mirrors cost <10 MB/slot vs ~27 MB/slot temporal — see §Third round and PR #38619 | ckpt pool 48 slots / 1.42 GB funded by pool 1441792→1179648; soak 326/326; eviction headroom for many distinct long prefixes |
+| 8b | *(round-5 layer)* `mamba-max-states-per-path`: -1 (uncapped) → **16** | the int8 pool is 128 slots; under extra_buffer_lazy chunked prefill donates **1 ckpt per 4096 tok** → one 549K chain ≈134 slots → two chains mutually LRU-evict each other's checkpoints → `cached=0` (see §Fifth round) | 2×549K and 3×495K re-asks 89 s → 0.9–1.5 s full hit; C12 unchanged; zero VRAM cost |
 
 Operational note baked into the units: `mamba-radix-cache-strategy` and `ple-offload-embedding` are alias/BooleanOptionalAction args that the YAML ConfigArgumentMerger rejects (`DeprecatedAliasStoreAction`) — they must stay as CLI flags in the systemd `ExecStart`, never in the YAML.
 
@@ -86,6 +87,25 @@ Measured on the live stack (cold pool ON + decode graphs + NEXTN steps=2, conc 1
 
 Honest caveats: the demand probe is torch-only (≈0.3 ms/layer/tick in eager — invisible under graphs, Triton kernel deferred to the speed phase); keep=330/slots=16 is a starting point, not a tuned optimum; the reference author's own conclusion (static keep-sets Pareto-optimal, dynamic staging WIP) is a live hypothesis we still have to beat with Phase B data; and greedy byte-level nondeterminism exists **with the cold pool fully OFF** (atomics/cuBLAS runtime property, OFF-control proven) — quality gates are checksum + semantics + error counters, never raw byte equality.
 
+## Fifth round (2026-09-11): cached=0 solved — per-path mamba checkpoint cap
+
+**Symptom**: re-asking a huge prompt returned `cached_tokens: 0` and re-prefilled cold (≈89 s at 549K). The radix tree was still there and so were its KV pages — what was missing was the **mamba** side state: a prefix match requires the deepest node carrying a valid mamba checkpoint, so no checkpoints means no reuse. Five hypotheses died under the evidence matrix (template wording, single context size, pool occupancy, mamba anchor starvation, the int8 path itself — D2 still double-missed with int8 checkpoints *disabled*).
+
+**Forensics (E3)**: three probes — match exit, split event, donate site (with the int8 pool watermark read out per event) — env-gated behind `SGLANG_E3_PROBE=1`, mounted on the live service for one day, then fully removed (source md5s, zero greps, clean process `environ`, zero journal hits). The smoking gun: under `extra_buffer_lazy`, chunked prefill **donates one int8 checkpoint per 4096-token chunk** (PREP `cache_len` marching 12544 → 16640 → 20736 …). A 549K chain ≈ **134 checkpoints > the 128-slot pool** (pool = 2× `max_mamba_cache_size` 64; `mamba_max_states_per_path` defaults to `-1`, uncapped). Two long chains together = 268 → mutual LRU eviction; the loser's re-ask matches nothing. The miss re-prefills and donates again — self-amplifying (this killed the three-chain cases, and equally fp8kv's old 3×336K all-miss result).
+
+**Fix**: `--mamba-max-states-per-path 16` — one flag, zero VRAM, both schemes. A chain keeps 16 evenly spread anchors instead of 134 dense ones; whole-document re-ask is untouched, mid-document deep branching just recomputes a middle segment (self-healing, never a correctness failure). Pool watermarks went from slow-motion exhaustion to steady `ckpt_free 82/128`. Before → after:
+
+| Shape | cap -1 | cap 16 |
+|---|---|---|
+| D2 · 2×549K re-ask | 88.8 / 91.0 s, cached=0 | **0.9 / 1.0 s, cached=548,864 — both hit** |
+| hw77 · 3×495K re-ask | 74.5–74.8 s, cached=0 | **1.1 / 1.5 s, cached=494,848 — hit** |
+| g2x · 3×233K re-ask | already hit (under the cliff) | unchanged |
+| C12 burst | 704–710 tok/s | 606–703 tok/s, accept 2.18–2.31 — noise band |
+
+**Rejected**: growing the pool to 256 slots (+3.7 GB against 5.29 GB of headroom = permanent OOM tightrope) — and checkpoint count scales linearly with document length, so 2×549K would blow through it anyway; the cap removes the cliff instead of moving it. Deferred lever: coarsening the donate interval 4096→16384 (≈34 ckpt/chain, at ~16K extra recompute cost on partial hits).
+
+**Attribution correction**: this is **not** upstream #22935 (split-tombstone) — the #38625-style interior checkpoints are behavior `extra_buffer_lazy` already implements. Pure capacity economics on our side of the fence.
+
 ## The fp8kv scheme (rollback stack)
 
 fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable half of the nvfp4kv tuning, so the two schemes swap on one GPU without losing the generic wins.
@@ -97,15 +117,18 @@ fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable
 | SAM=decode | ported | Pure backend routing for verify/draft batches |
 | FR-Spec 64K hot map | ported, same `.pt` | The map is tokenizer-scoped, not KV-dtype-scoped |
 | extra_buffer_lazy (CLI-only alias) | ported | Same slot economics |
-| MTP steps | kept **3** (nvfp4kv: 2) | fp8 accept-len runs 2.08–2.50 — the deeper chain still pays |
-| KV pool | kept **552,960** | nvfp4kv's +64K is bought by fp4 halving KV bytes; fp8 has no equivalent headroom |
-| HiCache L2 | kept **ON** | Works under fp8; nvfp4kv requires it OFF (#36121) |
+| int8 mamba ckpt + `mamba-max-states-per-path 16` | added (round 5, CLI flags) | Same donate-storm fix; fp8kv's old 3×336K all-miss case belongs to this family (96-slot pool, ~82 ckpt/chain uncapped) |
+| MTP steps | 3 → **2** (round-4 A/B) | steps2 won concurrency (C4 aggregate 431–438 tok/s); the 09-08 "keep 3" reading is superseded |
+| KV pool | 552,960 → **1,310,720** | B+ rung: 2× full 524K chains co-resident — the expert cold pool migrated to fp8kv too, funding it |
+| mamba cache | 24 → **48** | anchor-slot ladder; int8 pool auto-sizes 2× (96 slots) |
+| HiCache L2 | **OFF** | Upstream fail-fast against int8 mamba checkpoints (`server_args.py:6333`) — same-side trade as nvfp4kv's #36121 ban |
+| Expert cold pool | added (round 4+) | `switch_fp8kv_coldpool.sh`, same keep330+16 staging as nvfp4kv |
 
-Hot-state after the port (two-pass, second run): fp8kv C1 ≈165 / C6 aggregate ≈355–365 tok/s. An earlier single-pass ~200 C1 reading did not reproduce post-port — trust the two-pass numbers. Note the crossover: fp8kv (spec-on 512K) beats nvfp4kv (spec-off 1M) on C1 (≈165 vs ≈75–90) while nvfp4kv buys 2× context capacity and eviction headroom for distinct long prefixes. Pick fp8kv for latency-sensitive single-stream work; pick nvfp4kv when context capacity matters. Same port, same served-model-name — swapping = stop one unit, start the other. Rollback anchor: the fp8kv pair in `config/baseline/`.
+Hot-state (round-4 era): fp8kv at steps=2 runs C4 aggregate ≈431–438 tok/s (the A/B winner; steps=3 measured slower under concurrency despite deeper accept chains). Both schemes share one GPU and are mutually exclusive — since 2026-09-10 fp8kv sits stopped (nvfp4kv live; fp8kv in `failed` state after a manual KILL, so cap16 activates on its next bring-up). Pick fp8kv for latency-sensitive single-stream work; pick nvfp4kv when context capacity matters. Same port, same served-model-name — swapping = stop one unit, start the other. Rollback anchor: the fp8kv pair in `config/baseline/`.
 
 ## Why nvfp4 KV
 
-The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is what makes 1M context at conc 6 possible at all — the weights, the ~44 GB pinned PLE n-gram table and the CUDA graphs eat everything else. The single-stream decode tax is inherent to gather-dequant (two Triton launches + one dequant kernel per step); with spec-off at 1M the hot state sits at C1 ≈75–90 tok/s, and the round-3 int8 checkpoint pool adds eviction headroom for many distinct long prefixes. Pick fp8kv (512K, spec-on) when raw decode speed matters; pick nvfp4kv when context capacity matters.
+The fp4 KV pool halves KV memory (packed e2m1 + tiny per-block scales), which on a 96 GB card is what makes 1M context at conc 12 possible at all — the weights, the ~44 GB pinned PLE n-gram table and the CUDA graphs eat everything else. The single-stream decode tax is inherent to gather-dequant (two Triton launches + one dequant kernel per step); round 4's cold pool freed the VRAM that re-funds spec (C1 ≈122–129 tok/s with steps=2), and rounds 3+5 gave the checkpoint pools the real eviction headroom. Pick fp8kv (512K) when raw decode speed matters; pick nvfp4kv when context capacity matters.
 
 ## Contents
 
@@ -127,13 +150,14 @@ patches/
                              keep-mask + post-pwal shrink + flat pin + demand
                              staging + v2.9 TopKConfig identity gate
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — FOURTH ROUND (current): conc12 / 1M /
-                                    spec ON steps=2 / mamba48 / KV pool 2359296 / int8 mamba
-                                    checkpoint ON (96 slots) / cold pool keep330+16 /
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV scheme — ROUND 5 FROZEN (current): conc12 /
+                                    1M / spec ON steps=2 / mamba64 + per-path ckpt cap 16 /
+                                    KV pool 2359296 / int8 mamba checkpoint ON (128 slots) /
+                                    cold pool keep330+16 /
                                     decode CG bs[1,2,4,6,8,10,12] / prefill CG disabled
   expert_keep_330_final.json        per-layer keep-set (48 × 330 global expert ids) from the
                                     router-frequency census — cold pool's arm input
-  dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme — tuned rollback stack (conc4 / 512K / MTP3 / mamba24 / HiCache ON; portable items ported 2026-09-08: GDN dual-end flashinfer, CG-full prefill, SAM=decode, FR-Spec map, ABL=lazy — steps kept 3, accept-len 2.08-2.50 favors depth under fp8 batch shapes)
+  dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme — rollback stack (conc4 / 512K / MTP steps=2 / mamba48 + per-path cap 16 / int8 ckpt ON / HiCache OFF / KV pool 1310720 / expert cold pool; 2026-09-08 portable port + round-4 steps2 A/B + round-5 cached0 cap)
   baseline/                         Pre-tuning BASELINE snapshots for BOTH schemes, kept as
                                     rollback points and before/after evidence:
                                     nvfp4kv — mamba32 auto-sized, KV pool 786432, no FR-Spec map,
@@ -170,6 +194,11 @@ tests/
                              remap+bias, packed remap, demand stash, weak-demand
                              rejection, inventory gate, free-row accounting, bias
                              cache refresh, mask-starvation probe, identity gate)
+  probe_cached0_discrim.py   round-5 discriminator: D1 1×517K vs D2 2×549K branch
+                             chains, per-line cached_tokens hit/miss
+  probe_highwater_77.py      3×495K high-water probe (cold fill + A/B/C re-asks)
+  probe_g2x.py / probe_nvfp4_mamba_gate.py
+                             mamba-slot / anchor-gate probes (G2X: 3×233K all-hit)
 docs/
   RESULTS.md                  full stress matrix, MTP steps 1–3 calibration table,
                               mamba slot economics, every dead-end and root cause
@@ -190,6 +219,7 @@ docs/
 8. **NVFP4 per-expert side tensors defeat `dim0 == E` heuristics.** Beyond `w13/w2_weight` + block scales, each expert owns `weight_scale_2`/`input_scale` scalars and derived `g1_alphas`/`g1_alphas_up`/`g2_alphas`; `process_weights_after_loading` deinterleaves w13, swizzles scales and may alias derived params into source storage. The shrink must snapshot **post-pwal** state (hook in `model_runner.load_model`, not the weight loader), round-trip every whitelisted tensor, and refuse to arm on anything unknown. `w*_blockscale_swizzled` is only safe while it aliases its source Parameter — guard for it.
 9. **A keep-masked router cannot feed its own demand signal.** Cold experts are `-inf`-masked, so selection-path demand is structurally zero and the pool starves forever (observed: 30 min traffic, staged=0). Demand must be probed from raw **pre-mask** logits in the alpha band. Related trap class: any stash-buffer slice read before refill must be `.clone()`d — a view erased by `fill_` silently killed the strong-demand filter in v1 of the probe.
 10. **Spec-decoding drafts share the decoder `layer_id` namespace in-process.** The NEXTN draft model is the same class with `num_hidden_layers=1` → its layer 0 collides with target layer 0. Any per-layer runtime mechanism (mask, remap, stats) gated on `layer_id` alone will silently hijack drafts — gate on **object identity** of the module's TopKConfig registered at arm time (v2.9; symptom was accept rate 0.21 with drafts masked+remapped).
+11. **Under `extra_buffer_lazy` + int8 mamba checkpoints, prefix reuse is capped by the checkpoint pool, not the KV tree.** Chunked prefill donates one int8 checkpoint per 4096-token chunk; with the default per-path cap of −1, a single 549K chain eats ≈134 of the 128 pool slots, so two chains evict each other into `cached=0` (tree and KV pages present, match dead). `--mamba-max-states-per-path 16` is the zero-VRAM fix, on both schemes; the re-ask cliff (89 s → 0.9 s) is the proof. Upstream #22935 looks similar but is a different family (`no_buffer`) — don't chase its split-tombstone fix.
 
 ## Reproduce
 
@@ -220,6 +250,11 @@ bash scripts/switch_coldpool.sh graphs   # then CUDA graphs
 bash scripts/switch_coldpool.sh mtp      # then NEXTN spec
 bash scripts/switch_coldpool.sh off      # full rollback at any step
 
+# 3b. (round 5, both schemes) cached0 cap — CLI flags on the units:
+#   --enable-int8-mamba-checkpoint --mamba-max-states-per-path 16
+#   int8 pool auto-sizes 2× max_mamba_cache_size; the cap keeps N long
+#   chains co-resident (16 ckpt/path vs ≈134 per 549K chain uncapped)
+
 # 4. verify
 curl -s localhost:8000/v1/models          # → Qwen3.8-Flash-Next-NVFP4
 curl -s localhost:8000/get_server_info | jq '.kv_cache_dtype, .disable_radix_cache'
@@ -230,8 +265,8 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
-- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-4 live state: cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 48 / KV pool 2,359,296 / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
-- Finalized fp8kv stack (same date): portable items ported (§The fp8kv scheme), steps kept 3, HiCache ON, conc4 / YaRN×2 512K / KV pool 552,960, FR-Spec map shared. Hot-state: C1≈165 / C6≈355–365 / accept len≈2.08–2.50. Rollback = its own `config/baseline/` pair over the current files.
+- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-5 frozen live state: cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / per-path ckpt cap 16 (int8 pool 128 slots) / KV pool 2,359,296 / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
+- Finalized fp8kv stack: portable items ported (§The fp8kv scheme), MTP steps=2 (round-4 A/B superseded the 09-08 "keep 3"), HiCache OFF (int8-ckpt fail-fast), conc4 / YaRN×2 512K / KV pool 1,310,720 / mamba 48 + cap 16 / expert cold pool. Hot-state: C4 ≈431–438 tok/s aggregate. Currently stopped (single-card mutex, nvfp4kv live) — cap16 activates on next bring-up. Rollback = its own `config/baseline/` pair over the current files.
 - Single consumer GPU + 44 GB pinned PLE table: the nvfp4kv and fp8kv schemes are mutually exclusive; expect ~4-5 min cold start (round 4 adds ~3.5 min weight load + shrink). The unit deliberately ships unenabled to avoid boot-time GPU contention.
 - Round-4 host-RAM budget is tight by design: 24.15 GB cold-pool pins + 64 GB PLE pinned table (power-of-two rounded from 47.7 GB — a `file`-backend A/B is deferred) on a 112 GB box → MemAvailable ~20 GB under soak. Watch `Shmem` and swap before adding any more pinned consumers.
 - C1 decode with the cold pool + spec (≈122–129) sits just below fp8kv (≈165) — the round-3 "fp4 KV is slower" gap was mostly the spec-off tax, not gather-dequant alone. Upstream native fp4 QSA decode pools (#37798) remain the path to close or invert the gap.
