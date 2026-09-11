@@ -1139,6 +1139,13 @@ class ModelRunner:
             )
         self.loader = loaded.loader
         self.model = loaded.model
+        # expert-cold-pool-v2: cold-pool shrink strictly AFTER process_weights_after_loading;
+        # draft workers never shrink (their unquant FusedMoE layer_id can
+        # collide with keep-mask keys)
+        from sglang.srt.layers.moe import expert_cold_pool as _ecp
+
+        if not self.is_draft_worker:
+            _ecp.maybe_shrink_after_process(self.model)
         self.startup_weight_load = loaded.startup_weight_load
         if loaded.remote_instance_weight_info is not None:
             self.remote_instance_weight_transporter.weight_info = (
@@ -1619,6 +1626,11 @@ class ModelRunner:
 
         if get_exec().moe.elastic_ep_backend is not None:
             self.maybe_join_ep_ranks()
+
+        # expert-cold-pool-v2: dynamic expert staging, strictly outside graph replay
+        from sglang.srt.layers.moe import expert_cold_pool as _ecp
+
+        _ecp.after_forward_hook()
 
         return output
 

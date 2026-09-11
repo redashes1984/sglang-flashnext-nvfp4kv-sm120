@@ -1,0 +1,3 @@
+#!/bin/bash
+# ninja wrapper: 强制低并行度，防止 flashinfer JIT 编译撑爆容器内存
+exec /usr/bin/ninja -j1 "$@"

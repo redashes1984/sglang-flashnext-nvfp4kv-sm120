@@ -205,6 +205,13 @@ docs/
   expert-dynamic-v2-design.md cold-pool v2 design: R1-R3 red lines from the v1
                               incident, Phase 0 tensor-inventory gate, eager-first
                               validation order, rollback gates
+bootstrap/
+  MANIFEST.md                 FULL-RESTORE checklist for a bare same-hardware box:
+                              verified base tarball (official sgl-project commit
+                              78c5024e9, sha256-pinned), per-file md5 table of the
+                              7-file overlay delta, NVIDIA/CUDA/Python stack versions
+  pip-freeze-20260911.txt     205-package environment lock (install --no-deps)
+  ninja-wrapper               /opt/fakebin/ninja shim — flashinfer JIT -j1 memory guard
 ```
 
 ## Key findings (the short version)
@@ -226,6 +233,8 @@ docs/
 ```bash
 # 0. sglang built from the qwen4-main-squashed branch (PR #36497 head) for sm120,
 #    e.g. CUDAARCHS=120 TORCH_CUDA_ARCH_LIST="12.0" — see jpezzulli/gabrielolympie repos.
+#    VERIFIED for full restore: official sgl-project commit 78c5024e9 builds it;
+#    pinned tarball sha256, env lock, ninja shim, chat template → bootstrap/MANIFEST.md
 export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
 
 # 1. patches (idempotent; re-run after any source sync)

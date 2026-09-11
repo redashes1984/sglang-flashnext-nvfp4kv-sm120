@@ -2118,6 +2118,17 @@ def select_experts(
         info=expert_location_dispatch_info,
     )
 
+    # expert-cold-pool-v2: runtime expert keep-mask/cold-pool (see layers/moe/expert_cold_pool.py)
+    from sglang.srt.layers.moe import expert_cold_pool as _ecp
+
+    _pre_mask_logits = None
+    # v2.9 IDENTITY gate: keep the layer_id, but only act when this caller's
+    # TopKConfig was registered by the shrink — MTP draft layers reuse
+    # decoder layer_id 0..47 inside the same process and must stay untouched.
+    _cp_lid = _ecp.is_managed_config(topk_config) if layer_id is not None else None
+    if _cp_lid is not None:
+        router_logits, _pre_mask_logits = _ecp.apply_keep_mask(_cp_lid, router_logits)
+
     # DeepSeek V2/V3/R1 series models use grouped_top_k
     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
     num_routed_topk = top_k - num_fused_shared_experts
@@ -2312,12 +2323,21 @@ def select_experts(
         expert_location_dispatch_info=expert_location_dispatch_info,
     )
 
+    # expert-cold-pool-v2: runtime expert keep-mask/cold-pool (see layers/moe/expert_cold_pool.py) + demand stash + global->slot remap
+    if _cp_lid is not None:
+        _k = topk_ids.shape[-1] if topk_ids.dim() > 1 else 1
+        _ecp.stash_demand(_cp_lid, _pre_mask_logits, recorder_topk_ids, _k)
+        topk_ids = _ecp.remap_topk_ids(_cp_lid, topk_ids)
+
     get_global_expert_distribution_recorder().on_select_experts(
         topk_ids=recorder_topk_ids
     )
 
     # ===== TO BE REFACTORED ====
     if packed_topk is not None:
+        # expert-cold-pool-v2: packed ids carry global expert ids in the high 16 bits
+        if _cp_lid is not None:
+            packed_topk = _ecp.remap_packed_ids(_cp_lid, packed_topk)
         return StandardTopKOutputPacked(
             topk_weights, topk_ids, router_logits, packed_topk
         )

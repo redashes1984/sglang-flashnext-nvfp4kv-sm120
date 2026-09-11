@@ -197,6 +197,12 @@ docs/
                               每一条死路和根因
   expert-dynamic-v2-design.md 冷池 v2 设计：v1 事故的 R1-R3 红线、Phase 0 张量清单门、
                               eager 先行验证顺序、回滚门禁
+bootstrap/
+  MANIFEST.md                 裸机完整恢复清单（同硬件新机器）：已核验的基线 tarball
+                              （官方 sgl-project commit 78c5024e9，sha256 钉死）、
+                              overlay 7 文件逐文件 md5 表、NVIDIA/CUDA/Python 栈版本
+  pip-freeze-20260911.txt     205 包环境锁（--no-deps 安装）
+  ninja-wrapper               /opt/fakebin/ninja shim —— flashinfer JIT -j1 内存护栏
 ```
 
 ## 关键发现（省流版）
@@ -218,6 +224,8 @@ docs/
 ```bash
 # 0. 为 sm120 构建 qwen4-main-squashed 分支（PR #36497 head）的 sglang，
 #    如 CUDAARCHS=120 TORCH_CUDA_ARCH_LIST="12.0" —— 细节见 jpezzulli/gabrielolympie 两仓库。
+#    完整恢复已核验：官方 sgl-project commit 78c5024e9 即可构建；
+#    钉死 tarball sha256、环境锁、ninja shim、聊天模板 → bootstrap/MANIFEST.md
 export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
 
 # 1. 补丁（幂等；每次同步源码后重跑）
