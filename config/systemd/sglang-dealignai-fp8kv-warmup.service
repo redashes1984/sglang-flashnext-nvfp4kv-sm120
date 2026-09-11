@@ -6,7 +6,7 @@ After=sglang-dealignai-qwen4exp-fp8kv.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/opt/sglang/bin/python /etc/sglang-flashnext/warmup_qsa_fp8kv.py
+ExecStart=/opt/sglang-env/bin/python /opt/sglang-config/warmup_qsa_fp8kv.py
 TimeoutStartSec=1500
 StandardOutput=journal
 StandardError=journal
