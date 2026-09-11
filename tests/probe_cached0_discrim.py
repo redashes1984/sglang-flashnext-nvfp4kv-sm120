@@ -20,10 +20,12 @@ def gen(text, mx=8):
         headers={"Content-Type": "application/json"})
     t0 = time.time()
     r = json.loads(urllib.request.urlopen(req, timeout=900).read())
-    return time.time() - t0, r.get("meta_info", {})
+    return time.time() - t0, r.get("meta_info", {}), t0
 
-def journal_stats(key, pat):
-    """Latest numbers for `pat` in journal blocks after the most recent MARK line."""
+def journal_stats(key, pat, t0=None, t1=None):
+    """Numbers matching `pat` after the newest MARK line; if no MARK ever hit
+    the journal (log_requests=False => it won't on live), fall back to syslog
+    timestamp window [t0-1, t1+3] so dual-source still works in the field."""
     txt = None
     try:
         if os.environ.get("HERMES_JOURNAL_FILE"):
@@ -35,14 +37,41 @@ def journal_stats(key, pat):
         print(f"[journal unavailable: {exc}]")
         txt = ""
     blocks = re.split(r"(?m)^.*" + re.escape(MARK) + r".*$", txt or "")
-    nums = re.findall(pat, blocks[-1]) if len(blocks) > 1 else []
-    return [float(n) for n in nums]
+    if len(blocks) > 1:
+        return [float(n) for n in re.findall(pat, blocks[-1])]
+    if t0 is None:
+        return []
+    return _window_nums(txt, pat, t0, t1)
 
-def cached_pair(mi):
-    """Return (meta_value, journal_value, verdict) from both evidence sources."""
+def _window_nums(txt, pat, t0, t1):
+    """Parse leading syslog stamps ('Sep 12 02:25:36'); year inferred, last
+    year back if the stamp is in the future."""
+    from datetime import datetime
+    now = datetime.now()
+    out = []
+    for line in txt.splitlines():
+        m = re.match(r"^([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ", line)
+        if not m:
+            continue
+        mon, d, hh, mm, ss = m.groups()
+        try:
+            ts = datetime(now.year, datetime.strptime(mon, "%b").month, int(d), int(hh), int(mm), int(ss))
+        except ValueError:
+            continue
+        if ts > now:
+            ts = ts.replace(year=now.year - 1)
+        e = ts.timestamp()
+        if t0 - 1 <= e <= t1 + 3:
+            out += [float(n) for n in re.findall(pat, line)]
+    return out
+
+def cached_pair(mi, t0=None, t1=None):
+    """Return (meta_value, journal_value, verdict) from both evidence sources.
+    Window path takes the max #cached-token row in the request window (the
+    reask's own prefill line dominates any cold chunk-0 row in range)."""
     meta = mi.get("cached_tokens")
-    jrn = journal_stats("cached", r"#cached-token:\s*([0-9]+)")
-    jv = jrn[0] if jrn else None
+    jrn = journal_stats("cached", r"#cached-token:\s*([0-9]+)", t0, t1)
+    jv = max(jrn) if jrn else None
     if meta is None or jv is None:
         verdict = "INCONCLUSIVE"
     else:
@@ -58,19 +87,19 @@ def brn(m, n):
 
 log("== D1 single 495K (bench-A template) ==")
 A = doc("Z1", 22000)
-t, m = gen(A + "\n锚点A的编号是什么？只答编号。", 16); log(f"D1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
-t, m = gen(A + "\n锚点A的编号是什么？只答编号。", 16)
-meta, jrn, verdict = cached_pair(m)
+t, m, _ = gen(A + "\n锚点A的编号是什么？只答编号。", 16); log(f"D1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
+t, m, t0 = gen(A + "\n锚点A的编号是什么？只答编号。", 16)
+meta, jrn, verdict = cached_pair(m, t0, time.time())
 log(f"D1 reask={t:.1f}s cached_meta={meta} cached_journal={jrn} verdict={verdict}")
 
 log("== D2 two 495K branch template ==")
 B = brn("甲2", 20000); C = brn("乙2", 20000)
-t, m = gen(B + "答：好", 16); log(f"D2 B cold={t:.1f}s pt={m.get('prompt_tokens')}")
-t, m = gen(C + "答：好", 16); log(f"D2 C cold={t:.1f}s")
-t, m = gen(B + "答：好", 16)
-meta, jrn, verdict = cached_pair(m)
+t, m, _ = gen(B + "答：好", 16); log(f"D2 B cold={t:.1f}s pt={m.get('prompt_tokens')}")
+t, m, _ = gen(C + "答：好", 16); log(f"D2 C cold={t:.1f}s")
+t, m, t0 = gen(B + "答：好", 16)
+meta, jrn, verdict = cached_pair(m, t0, time.time())
 log(f"D2 B reask={t:.1f}s cached_meta={meta} cached_journal={jrn} verdict={verdict}")
-t, m = gen(C + "答：好", 16)
-meta, jrn, verdict = cached_pair(m)
+t, m, t0 = gen(C + "答：好", 16)
+meta, jrn, verdict = cached_pair(m, t0, time.time())
 log(f"D2 C reask={t:.1f}s cached_meta={meta} cached_journal={jrn} verdict={verdict}")
 log("DISCRIM-DONE")

@@ -30,10 +30,11 @@ def gen(text, mx=8, timeout=900):
         headers={"Content-Type": "application/json"})
     t0 = time.time()
     r = json.loads(urllib.request.urlopen(req, timeout=timeout).read())
-    return time.time() - t0, r.get("meta_info", {})
+    return time.time() - t0, r.get("meta_info", {}), t0
 
-def journal_after_marker(pat):
-    """Numbers matching pat in journal blocks after the newest MARK line."""
+def journal_after_marker(pat, t0=None, t1=None):
+    """Numbers matching pat after the newest MARK line; no MARK in journal
+    (log_requests=False on live) => syslog timestamp-window fallback."""
     txt = None
     try:
         if os.environ.get("HERMES_JOURNAL_FILE"):
@@ -45,7 +46,28 @@ def journal_after_marker(pat):
         print(f"  [journal unavailable: {exc}]")
         txt = ""
     blocks = re.split(r"(?m)^.*" + re.escape(MARK) + r".*$", txt or "")
-    return re.findall(pat, blocks[-1]) if len(blocks) > 1 else []
+    if len(blocks) > 1:
+        return re.findall(pat, blocks[-1])
+    if t0 is None:
+        return []
+    from datetime import datetime
+    now = datetime.now()
+    out = []
+    for line in txt.splitlines():
+        m = re.match(r"^([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ", line)
+        if not m:
+            continue
+        mon, d, hh, mm, ss = m.groups()
+        try:
+            ts = datetime(now.year, datetime.strptime(mon, "%b").month, int(d), int(hh), int(mm), int(ss))
+        except ValueError:
+            continue
+        if ts > now:
+            ts = ts.replace(year=now.year - 1)
+        e = ts.timestamp()
+        if t0 - 1 <= e <= t1 + 3:
+            out += re.findall(pat, line)
+    return out
 
 def ctx(m, n):
     line = "锚定段落{m}-{i}：nvfp4kv长上下文槽位余量判别实验，文本稳定用于radix复用验证。"
@@ -57,11 +79,11 @@ N = 20000  # ~480K tokens per ctx (nvfp4kv ctx 1M, pool 2.36M)
 
 print("G1 single ~480K cold/re-ask")
 cA = ctx("A", N)
-t1, m1 = gen(cA + "答：好"); print(f"  cold={t1:.1f}s pt={m1.get('prompt_tokens')}")
-t2, m2 = gen(cA + "答：好")
+t1, m1, g1 = gen(cA + "答：好"); print(f"  cold={t1:.1f}s pt={m1.get('prompt_tokens')}")
+t2, m2, g2 = gen(cA + "答：好")
 meta = m2.get("cached_tokens")
-jrn = [float(x) for x in journal_after_marker(r"#cached-token:\s*([0-9]+)")[-1:]]
-jv = jrn[0] if jrn else None
+jw = [float(x) for x in journal_after_marker(r"#cached-token:\s*([0-9]+)", g2, time.time())]
+jv = max(jw) if jw else None
 pt = m2.get("prompt_tokens")
 if meta is None or jv is None or pt is None:
     inconclusive += 1
@@ -72,13 +94,15 @@ else:
 
 print("G2 two ~480K coexist")
 cB = ctx("B", N)
-t, _ = gen(cB + "答：好"); print(f"  B cold={t:.1f}s")
-t, m = gen(cA + "答：好")
-meta, jrn2 = m.get("cached_tokens"), journal_after_marker(r"#cached-token:\s*([0-9]+)")[-1:]
+t, _, _ = gen(cB + "答：好"); print(f"  B cold={t:.1f}s")
+t, m, g3 = gen(cA + "答：好")
+j2 = [float(x) for x in journal_after_marker(r"#cached-token:\s*([0-9]+)", g3, time.time())]
+meta, jrn2 = m.get("cached_tokens"), ([max(j2)] if j2 else [])
 print(f"  A reask={t:.1f}s cached_meta={meta} cached_journal={jrn2[0] if jrn2 else None}")
 if t > 5: fails += 1; print("  G2-A FAIL (anchor evicted by B)")
-t, m = gen(cB + "答：好")
-meta, jrn2 = m.get("cached_tokens"), journal_after_marker(r"#cached-token:\s*([0-9]+)")[-1:]
+t, m, g4 = gen(cB + "答：好")
+j4 = [float(x) for x in journal_after_marker(r"#cached-token:\s*([0-9]+)", g4, time.time())]
+meta, jrn2 = m.get("cached_tokens"), ([max(j4)] if j4 else [])
 print(f"  B reask={t:.1f}s cached_meta={meta} cached_journal={jrn2[0] if jrn2 else None}")
 if t > 5: fails += 1; print("  G2-B FAIL")
 
@@ -90,7 +114,7 @@ procs = [subprocess.Popen(["curl", "-s", "-m", "180", URL, "-H", "Content-Type: 
 for p in procs: p.wait()
 dt = time.time() - t0
 # headline: aggregate journal gen throughput (token/s) after marker; awk value reference-only
-tp = [float(x) for x in journal_after_marker(r"gen throughput \(token/s\): ([0-9.]+)")]
+tp = [float(x) for x in journal_after_marker(r"gen throughput \(token/s\): ([0-9.]+)", t0, time.time())]
 peak = max(tp) if tp else None
 ref = 2400 / dt if dt else 0
 print(f"  journal gen-throughput peak={peak} tok/s (headline; n={len(tp)} samples)")

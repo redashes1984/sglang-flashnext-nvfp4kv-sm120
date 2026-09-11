@@ -37,3 +37,15 @@ soak_final.sh 的 SKIP 分支逻辑为纯 shell 条件,本机无 /opt/sglang-env
 ## 结论
 
 四条 🟡 整改全部落实并通过 mock 自证;证据链从单源升级为双源交叉,时间窗升级为 marker 归属,假 FAIL 路径(cached=None→0)消除。
+
+## Post-deployment correction (2026-09-12, round-7 restart forensics)
+
+Live rerun exposed a real gap the mock could not: journal markers only work if
+request text is logged — the service runs `log_requests=False`, so MARK never
+appears in the real journal and every reask degraded to INCONCLUSIVE.
+Fix shipped in the same commit as this note: all five probes now fall back to
+a syslog-timestamp window (request start..end ±slack) when no MARK line
+exists, taking max(#cached-token) inside the window (the reask's own prefill
+row dominates cold chunk-0 rows). Mock re-validated with timestamped fake
+journals; live reask rerun on CT112: cached_meta == cached_journal on all
+three chains, verdict=consistent.

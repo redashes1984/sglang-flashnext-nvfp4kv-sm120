@@ -20,11 +20,13 @@ def gen(text, mx=8):
         headers={"Content-Type": "application/json"})
     t0 = time.time()
     r = json.loads(urllib.request.urlopen(req, timeout=900).read())
-    return time.time() - t0, r.get("meta_info", {})
+    return time.time() - t0, r.get("meta_info", {}), t0
 
 def log(*a): print(*a, flush=True)
 
-def journal_stats(key, pat):
+def journal_stats(key, pat, t0=None, t1=None):
+    """Numbers matching pat after the newest MARK line; no MARK in journal
+    (log_requests=False on live) => syslog timestamp-window fallback."""
     txt = None
     try:
         if os.environ.get("HERMES_JOURNAL_FILE"):
@@ -36,13 +38,36 @@ def journal_stats(key, pat):
         print(f"[journal unavailable: {exc}]")
         txt = ""
     blocks = re.split(r"(?m)^.*" + re.escape(MARK) + r".*$", txt or "")
-    nums = re.findall(pat, blocks[-1]) if len(blocks) > 1 else []
-    return [float(n) for n in nums]
+    if len(blocks) > 1:
+        return [float(n) for n in re.findall(pat, blocks[-1])]
+    if t0 is None:
+        return []
+    return _window_nums(txt, pat, t0, t1)
 
-def cached_pair(mi):
+def _window_nums(txt, pat, t0, t1):
+    from datetime import datetime
+    now = datetime.now()
+    out = []
+    for line in txt.splitlines():
+        m = re.match(r"^([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) ", line)
+        if not m:
+            continue
+        mon, d, hh, mm, ss = m.groups()
+        try:
+            ts = datetime(now.year, datetime.strptime(mon, "%b").month, int(d), int(hh), int(mm), int(ss))
+        except ValueError:
+            continue
+        if ts > now:
+            ts = ts.replace(year=now.year - 1)
+        e = ts.timestamp()
+        if t0 - 1 <= e <= t1 + 3:
+            out += [float(n) for n in re.findall(pat, line)]
+    return out
+
+def cached_pair(mi, t0=None, t1=None):
     meta = mi.get("cached_tokens")
-    jrn = journal_stats("cached", r"#cached-token:\s*([0-9]+)")
-    jv = jrn[0] if jrn else None
+    jrn = journal_stats("cached", r"#cached-token:\s*([0-9]+)", t0, t1)
+    jv = max(jrn) if jrn else None
     if meta is None or jv is None:
         verdict = "INCONCLUSIVE"
     else:
@@ -55,11 +80,11 @@ def make_ctx(m, n):   # EXACT bench template
 
 N = 22000  # ~605K tokens per ctx (bench A's line ~27.6 tok/line)
 cA, cB, cC = make_ctx("AA", N), make_ctx("BB", N), make_ctx("CC", N)
-t, m = gen(cA + "\n锚点A的编号是什么？只答编号。", 16); log(f"A1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
-t, m = gen(cB + "\n锚点B的编号是什么？只答编号。", 16); log(f"B1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
-t, m = gen(cC + "\n锚点C的编号是什么？只答编号。", 16); log(f"C1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
+t, m, tg = gen(cA + "\n锚点A的编号是什么？只答编号。", 16); log(f"A1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
+t, m, tg = gen(cB + "\n锚点B的编号是什么？只答编号。", 16); log(f"B1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
+t, m, tg = gen(cC + "\n锚点C的编号是什么？只答编号。", 16); log(f"C1 cold={t:.1f}s pt={m.get('prompt_tokens')}")
 for tag, txt in (("A2", cA), ("B2", cB), ("C2", cC)):
-    t, m = gen(txt + "\n锚点" + tag[0] + "的编号是什么？只答编号。", 16)
-    meta, jrn, verdict = cached_pair(m)
+    t, m, tg = gen(txt + "\n锚点" + tag[0] + "的编号是什么？只答编号。", 16)
+    meta, jrn, verdict = cached_pair(m, tg, time.time())
     log(f"{tag} reask={t:.1f}s cached_meta={meta} cached_journal={jrn} verdict={verdict}")
 log("HIGHWATER-DONE")
