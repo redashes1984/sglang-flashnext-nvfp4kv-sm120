@@ -54,7 +54,7 @@ cuda-graph-config:
     bs: [1, 2, 4, 6, 8]                 # 09-11 随 conc8 扩桶（capture 增量 ~0.6GB 已在 4.2GB fence 预算内）
     max_bs: 8
   prefill:
-    backend: full          # 强制 full 捕获绕开 Breakable×multimodal 自动禁用（nvfp4kv 同款，#28386）
+    backend: full          # round-2 定档项#4：强制 full 绕开 Breakable×multimodal 自动禁用（#28386）。现状注（09-11 journal 实证）：spec/EAGLE 在线时 #28386 守卫临时关回（"Disable prefill CUDA graph for EAGLE target"，timings prefill=0.00）；守卫解除或关 spec 自动生效
     max_bs: 4096           # 对齐 chunked-prefill-size；捕获开销 ~0.56GB / ~30s
 
 # --- Speculative decoding NEXTN (migrated from systemd) ---

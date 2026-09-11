@@ -29,7 +29,7 @@ quantization: modelopt_fp4
 
 # --- Memory ---
 mem-fraction-static: 0.96
-max-total-tokens: 2359296                  # boundary probe +262K over 2M
+max-total-tokens: 2477312                  # 09-11 决策: 2,359,296(恰=9×256K,零余量) × 1.05 防溢出 = 2,477,260.8 → 64页对齐 2,477,312（+118,016 tok slack ≈ 每会话 9.8K 生成余量）。nvfp4 几何实测 6,969 B/token（boot 16.44GB/池）→ 成本 +0.82GB，fence 5.29→~4.47GB 仍安全。下次 nvfp4 bring-up 生效
 context-length: 1048576                    # YaRN x4; override in json-model-override-args
 max-running-requests: 12
 max-prefill-tokens: 16384
@@ -52,7 +52,8 @@ cuda-graph-config:
     bs: [1, 2, 4, 6, 8, 10, 12]
     max_bs: 12   # conc12 trial 2026-09-10
   prefill:
-    backend: disabled      # 同上；fp8kv 1M 实验同款处置
+    backend: full          # 09-11 与 fp8kv 统一意图声明（round-2 定档项#4：强制 full 绕开 Breakable×multimodal 自动禁用，#28386 一类，prefill ≈10K 无抖动）。现状诚实注：spec/EAGLE 在线时上游 #28386 守卫会临时关回（journal 见 "Disable prefill CUDA graph for EAGLE target"），启动 timings 里 prefill=0.00；守卫解除或关 spec 即自动生效。捕获开销 ~0.56GB/30s
+    max_bs: 4096           # 对齐 chunked-prefill-size
 
 # --- Speculative decoding NEXTN ---
 speculative-algorithm: NEXTN
