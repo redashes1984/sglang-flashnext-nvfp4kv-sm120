@@ -12,10 +12,55 @@ import tempfile
 
 os.environ["SGLANG_EXPERT_KEEP_MASK"] = ""  # set per-test below
 
-import torch
+try:
+    import pytest
+except ImportError:
+    pytest = None
+try:
+    import torch
+except ImportError:
+    torch = None
+
+if pytest is not None:
+    pytestmark = pytest.mark.skipif(
+        torch is None, reason="torch unavailable on this interpreter; cold-pool logic skipped"
+    )
+if torch is None:
+    sys.exit("SKIP: torch unavailable; pure-CPU torch logic tests cannot run")
+
+# CPU-only torch (this box has no CUDA): torch.cuda.is_current_stream_capturing
+# is a dummy stub there. Mock it — capture-in-progress is False on CPU.
+if not torch.cuda.is_available():
+    torch.cuda.is_current_stream_capturing = lambda: False
 
 sys.path.insert(0, "/opt/sglang-test")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "patches"))
 import expert_cold_pool as ecp  # noqa
+
+# Minimal stub for sglang's replace_parameter so the logic tests run on boxes
+# without the full sglang install (CT112 has the real module and takes the
+# try-path). Semantics needed by _replace_with_aliases: register the Parameter
+# under the name and rebind the attribute to the same object.
+try:
+    import sglang.srt.layers.quantization.utils  # noqa: F401
+except ImportError:
+    def _stub_sglang_utils():
+        parts = "sglang.srt.layers.quantization.utils".split(".")
+        mods = {}
+        for i, name in enumerate(parts):
+            m = types.ModuleType(".".join(parts[: i + 1]))
+            sys.modules[m.__name__] = m
+            mods[name] = m
+        mods["layers"].quantization = mods["quantization"]
+        mods["quantization"].utils = mods["utils"]
+
+        def replace_parameter(module, name, new_p):
+            module._parameters[name] = new_p
+            setattr(module, name, new_p)
+            return new_p
+
+        mods["utils"].replace_parameter = replace_parameter
+    _stub_sglang_utils()
 
 FAIL = []
 
@@ -359,6 +404,45 @@ def test_identity_gate_draft_layers():
     ecp._CFG_LIDS.clear(); ecp._CFG_REFS.clear()
 
 
+def test_remap_fused_shared_passthrough():
+    """audit R1: fused-shared-expert cols (num_fused_shared_experts>0 -> ids >= width)
+    must pass remap_topk_ids through verbatim without the gather going OOB."""
+    print("[T10] fused-shared ids pass through remap_topk_ids verbatim")
+    had = ecp._STATE["shrunk"]
+    ecp._REMAP_CACHE.clear(); ecp._BIAS_CACHE.clear()
+    ecp.build_tables(0, [3, 7], 12, 4, 32, "cpu")  # non-identity keep -> proves lookup fires
+    ecp._STATE["shrunk"] = True
+    tbl = ecp._REMAP_CACHE[0]
+    n = int(tbl.numel())  # == width == num_experts
+    ids = torch.tensor([[3, 7, n, n + 3, -1]])
+    out = ecp.remap_topk_ids(0, ids)
+    check(out.shape == ids.shape, "shape preserved")
+    check(int(out[0, 0]) == 0 and int(out[0, 1]) == 1,
+          f"in-range ids go THROUGH the table lookup: {out[0][:2].tolist()}")
+    check(int(out[0, 2]) == n and int(out[0, 3]) == n + 3,
+          f"fused-shared cols pass through verbatim, no gather OOB: {out[0].tolist()}")
+    check(int(out[0, 4]) == -1, "-1 padding still verbatim")
+    ecp._STATE["shrunk"] = had
+
+
+def test_stash_filters_fused_shared():
+    """audit R1 stash side: fused-shared col must be filtered out of demand stats,
+    not clamped onto the last expert column and counted toward it."""
+    print("[T11] stash_demand: fused-shared col dropped from demand")
+    ecp._STATE["dynamic"] = True
+    E = 32
+    logits = torch.full((1, E), -10.0)
+    logits[0, 5] = 4.0
+    ids = torch.tensor([[5, 0, 1, 2, 3, 4, 6, 7, 8, E]])  # last = fused-shared id
+    ecp._STASH.clear()
+    ecp.stash_demand(0, logits, ids, 10)
+    b = ecp._STASH[0]
+    check(int(b["ids"][9]) == -1, "fused-shared col dropped from stash")
+    check(float(b["scores"][9]) == -1.0, "its score neutral (never counted)")
+    check(b["ids"][:9].tolist() == [5, 0, 1, 2, 3, 4, 6, 7, 8], "real expert ids survive intact")
+    check(all(float(x) > -1.0 for x in b["scores"][:9].tolist()), "real experts keep sigmoid scores")
+
+
 def main():
     test_shrink_and_stage()
     test_remap_fn()
@@ -369,6 +453,8 @@ def main():
     test_inventory_gate()
     test_cold_probe_breaks_mask_starvation()
     test_identity_gate_draft_layers()
+    test_remap_fused_shared_passthrough()
+    test_stash_filters_fused_shared()
     print()
     if FAIL:
         print(f"RESULT: {len(FAIL)} FAILURES")

@@ -300,8 +300,13 @@ def remap_topk_ids(layer_id, topk_ids):
     # padded/masked rows carry id=-1 (_mask_topk_ids_padded_region fill_value=-1):
     # tbl[-1] would SILENTLY map them to the last expert's row. Keep -1 verbatim.
     safe = topk_ids.clamp(min=0).long()
-    mapped = tbl[safe].to(topk_ids.dtype)
-    return torch.where(topk_ids >= 0, mapped, topk_ids)
+    # fused-shared-expert ids (num_fused_shared_experts>0) are >= tbl.numel():
+    # they address rows outside this table, so pass them through verbatim like
+    # the -1 padding instead of gathering out of bounds. Mirrors the packed
+    # path's clamp(max=tbl.numel()-1) (:322) — both remap lanes now symmetric.
+    ok = (safe < tbl.numel()) & (topk_ids >= 0)
+    mapped = tbl[safe.clamp(max=tbl.numel() - 1)].to(topk_ids.dtype)
+    return torch.where(ok, mapped, topk_ids)
 
 
 def remap_packed_ids(layer_id, packed):
@@ -333,8 +338,11 @@ def stash_demand(layer_id, pre_mask_logits, topk_ids, k):
         rows = int(topk_ids.shape[0])
         idx = topk_ids.reshape(rows, -1).long()
         width = int(pre_mask_logits.shape[-1])
-        neg = idx < 0  # padded/masked rows: never feed them as demand for expert 0
-        idx = idx.clamp(min=0, max=width - 1)  # fused-shared-expert ids above width: masked later anyway
+        # padded rows AND fused-shared cols (id >= width) are not demand: without
+        # the upper bound they were clamped onto the last expert column and counted
+        # toward it (audit R1). clamp keeps the gather in range for surviving cols.
+        neg = (idx < 0) | (idx >= width)
+        idx = idx.clamp(min=0, max=width - 1)
         # true scores from PRE-mask logits (renormalized/masked weights would poison
         # the strong-demand band test); raw-logit sigmoid — the scale factor is a
         # monotone constant on the softmax-free router and cancels in alpha comparisons

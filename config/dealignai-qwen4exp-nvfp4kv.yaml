@@ -43,6 +43,7 @@ chunked-prefill-size: 4096
 schedule-policy: lpm
 max-mamba-cache-size: 64                # conc12 x 4/req CONSTANT + 16 anchor slack (fp8kv cached0 lesson, G2X gate 2026-09-10: 3x233K all-hit 0.5s, C12 608 tok/s no regression; int8 ckpt auto 128 slots 3.74GB, avail 5.29GB)
 mamba-max-states-per-path: 16           # cached0 ROOT FIX 2026-09-11: cap per-path mamba checkpoints so N long chains coexist in the 128-slot int8 pool. E3 probe: chunked-prefill donates 1 ckpt/4096 tok (549K chain=134>128 slots -> mutual eviction -> cached=0). cap16: D2 2x549K reask 89s->0.9s full hit. Whole-doc reuse unaffected; mid-doc deep branching loses depth (self-heals). Cost=0
+                                          # EXPLICIT PRECONDITION (audit R2): int8 ckpt pool = 2x max-mamba-cache-size(64) = 128 slots; cap16 -> at most 8 deep chains coexist (128/16). Under max-running-requests=12, IF >8 concurrent 500K+ deep chains share the tail, mutual eviction -> cached=0 can still reappear at the margin. Current real workload has deep chains <=3, safe margin ~2.7x. fp8kv side closes exactly: conc8 x cap16 = 8x16=128 = pool, no gap. If deep-chain concurrency ever exceeds 8, lower this cap (~10) or raise max-mamba-cache-size.
 
 gdn-mtp-cache-mode: none
 
