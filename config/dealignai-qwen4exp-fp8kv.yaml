@@ -1,8 +1,8 @@
 # SGLang dealignai Qwen3.8-Flash-Next — FP8 KV 方案 (fp8kv)
-# conc4 / 1M / fp8 KV / MTP steps=2 / mamba 48 + 每路径帽16 / radix ON / HiCache OFF / cold pool keep330+16 / GDN=flashinfer双端 / prefill CG=full / SAM=decode / FR-Spec表 / ABL=lazy(CLI)
-#   2026-09-11 定档变更：ctx 524288→1048576（YaRN x4），KV 池 1310720→1651520 = (1x1M + 2x256K) × 1.05 防溢出（棣民要求 ≥5% 缓存余量，78,656 tok ≈ 每会话 26K gen slack）
-#     账本：fp8 KV 几何 12 层 full-attn ×12288B/tok → 1,651,520 tok ≈20.29GB；最后开机 capture 后 avail 8.41GB →
-#     扩后 fence ≈4.2GB（nvfp4kv 5.29GB 同档冰面）。mamba48/cap16/冷池/mem-frac 全部不动。
+# conc8 / 1M / fp8 KV / MTP steps=2 / mamba 48 + 每路径帽16 / radix ON / HiCache OFF / cold pool keep330+16 / GDN=flashinfer双端 / prefill CG=full / SAM=decode / FR-Spec表 / ABL=lazy(CLI)
+#   2026-09-11 定档变更：ctx 524288→1048576（YaRN x4），KV 池 1310720→1651520 = (1x1M + 2x256K) × 1.05 防溢出（棣民要求 ≥5% 缓存余量，78,656 tok ≈ 每会话 26K gen slack）；conc4→8（主会话并行喂 Hindsight/MoviePilot 小请求，decode CG 桶 [1,2,4]→[1,2,4,6,8]）
+#     账本：fp8 KV 几何 12 层 full-attn ×12288B/tok → 1,651,520 tok ≈20.29GB；最后开机 capture 后 avail 8.41GB；
+#     扩池 -4.19GB + conc8 新增 CG 桶 -0.3~0.6GB → 预期 fence ≈3.6-3.9GB（bring-up 时以 avail mem 行为准，<2.5GB 则回退 bs[1,2,4,6]）
 #     ⚠️ 未验项：YaRN x4 在 fp8 KV 下无 NIAH 背书（nvfp4 的 x4 已验）——下次 bring-up 必须 NIAH@1M 补验
 #   2x1M 双开已否决：需求 25.77GB > 16.11+8.41GB，差 1.25GB，拆东墙(mamba32+slots8)后 fence 剩 1.75GB 属自杀
 #   历史：2026-09-08 移植 nvfp4kv 调优项；steps 3→2（09-10 A/B：C4 431-438 胜 steps3）；HiCache 由 ON 改 OFF 系 int8 ckpt fail-fast（server_args.py:6333）
@@ -32,7 +32,7 @@ quantization: modelopt_fp4
 mem-fraction-static: 0.96
 max-total-tokens: 1651520                # 2026-09-11: (1x1M + 2x256K = 1,572,864) × 1.05 防溢出余量 = 1,651,520（64 页对齐，slack 78,656 tok）; ≈20.29GB pool, fence ≈4.2GB post-boot (nvfp4kv 5.29GB 同档); was 1310720 = 2x524K
 context-length: 1048576                  # YaRN x4 (was x2/512K, 09-11); override 见 json-model-override-args；fp8 下 x4 待 NIAH@1M 补验
-max-running-requests: 4
+max-running-requests: 8                 # 09-11: conc4→8（主 1M 会话时并行吃 Hindsight/MoviePilot 小请求）；显存增量 <50MB，mamba 8×4=32 ≤48-16 slack ✓，int8 池 3×16 长链 + 小请求 ≤4 份/路 < 96 ✓
 max-prefill-tokens: 16384
 chunked-prefill-size: 4096              # 1024 -> 4096, prefill 吞吐主提升
 
@@ -51,8 +51,8 @@ mamba-track-interval: 64
 # --- CUDA Graph (migrated; 等价替代 --cuda-graph-bs-decode 1 2 4 / --cuda-graph-max-bs-decode=4) ---
 cuda-graph-config:
   decode:
-    bs: [1, 2, 4]
-    max_bs: 4
+    bs: [1, 2, 4, 6, 8]                 # 09-11 随 conc8 扩桶（capture 增量 ~0.6GB 已在 4.2GB fence 预算内）
+    max_bs: 8
   prefill:
     backend: full          # 强制 full 捕获绕开 Breakable×multimodal 自动禁用（nvfp4kv 同款，#28386）
     max_bs: 4096           # 对齐 chunked-prefill-size；捕获开销 ~0.56GB / ~30s

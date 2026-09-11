@@ -268,7 +268,7 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 ## 约束与诚实声明
 
 - 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第五轮定档现役：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / 每路径 ckpt 帽 16（int8 池 128 槽）/ KV 池 2,359,296 / decode CG bs[1,2,4,6,8,10,12]。** 热态：C1 ≈122–129 / C12 聚合 ≈704–710 / prefill ≈9.7K（冷前缀）——预热后验收 bench（steps=2/draft3），取代早先热缓存窗口的 146–171 / 773–825。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
-- 定档 fp8kv 栈：可移植项已移植（见 §fp8kv 方案）、MTP steps=2（第四轮 A/B 取代 09-08 的「保持 3」）、HiCache 关（int8 ckpt fail-fast）、conc4 / YaRN×2 512K / KV 池 1,310,720 / mamba 48 + 帽 16 / 专家冷池。热态：C4 聚合 ≈431–438 tok/s。当前处于停止态（单卡互斥，nvfp4kv 现役）—— cap16 在其下次拉起时生效。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
+- 定档 fp8kv 栈（2026-09-11 升 1M）：可移植项已移植（见 §fp8kv 方案）、MTP steps=2（第四轮 A/B）、HiCache 关（int8 ckpt fail-fast）、conc4 / **YaRN×4 1M** / **KV 池 1,651,520 = (1×1M + 2×256K) × 1.05 防溢出余量**（池 ≈20.3 GB，扩后 fence ≈4.2 GB —— 与 nvfp4kv 的 5.29 同档冰面）/ mamba 48 + 帽 16 / 专家冷池。2×1M 双开已否决：需 25.77 GB，拆墙后 fence 剩 1.75 GB 属走钢丝。**上机门禁：YaRN×4 在 fp8 KV 下无 NIAH 背书——bring-up 必须先补验。**当前停止态（单卡互斥，nvfp4kv 现役）。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
 - 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4-5 分钟（第四轮多 ~3.5 分钟权重加载 + 收缩）。unit 故意不 enable，避免开机抢 GPU。
 - 第四轮主机内存预算是刻意压到极限的：冷池 pinned 24.15 GB + PLE 表 pinned 64 GB（47.7 GB 被 2 的幂取整 —— `file` 后端 A/B 已调研、暂缓）压在 112 GB 机器上 → soak 末 MemAvailable ~20 GB。再要挂任何 pinned 消费者之前先看 `Shmem` 与 swap。
 - 冷池 + 投机的 C1（≈122–129）已逼近但略低于 fp8kv（≈165）—— 第三轮"fp4 KV 更慢"的差距主要是 spec-off 税，不全是 gather-dequant。上游原生 fp4 QSA 解码池（#37798）是追平或反超的路。

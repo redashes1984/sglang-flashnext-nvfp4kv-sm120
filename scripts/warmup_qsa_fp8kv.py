@@ -7,7 +7,7 @@ when free VRAM has dropped <1GiB). Shapes covered (from 2026-09-07 journal):
     _qsa_graph_layout_kernel, _fused_slot_copy_kernel, get_last_loc_kernel,
     alloc_extend_kernel, assign_req_to_token_pool, _fused_commit_track_indices_kernel
   - response_format json_object -> apply_token_bitmask_inplace_kernel (xgrammar)
-  - 2 concurrent requests -> bs=2 decode specialization
+  - 8 concurrent requests -> bs 4/6/8 decode specializations (conc8 stack, 09-11)
 """
 import json, sys, time, threading
 import requests
@@ -46,11 +46,16 @@ def main():
     log(f"pass2 prefix-cache hit: {chat({'model':MODEL,'messages':base_msgs,'max_tokens':8,**kw})}")
     # 3) grammar bitmask kernel
     log(f"json_object grammar: {chat({'model':MODEL,'messages':[{'role':'user','content':'输出一个JSON对象，包含字段ok，值为true'}],'max_tokens':32,'response_format':{'type':'json_object'},**kw})}")
-    # 4) bs=2 concurrent decode
+    # 4) bs=8 concurrent decode (conc8 stack: covers bs 4/6/8 eager specializations
+    #    that boot-time graph capture does NOT warm on the Triton/eager fallback path)
     codes = []
-    ts = [threading.Thread(target=lambda: codes.append(chat({'model':MODEL,'messages':[{'role':'user','content':'说一句话，'+PROMPT[:200]}],'max_tokens':64,**kw}))) for _ in range(2)]
+    lock = threading.Lock()
+    def one():
+        c = chat({'model':MODEL,'messages':[{'role':'user','content':'说一句话，'+PROMPT[:200]}],'max_tokens':64,**kw})
+        with lock: codes.append(c)
+    ts = [threading.Thread(target=one) for _ in range(8)]
     [t.start() for t in ts]; [t.join() for t in ts]
-    log(f"concurrent bs2: {codes}")
+    log(f"concurrent bs8: {codes}")
     log("warmup complete - late-load window closed")
 
 if __name__ == "__main__":
