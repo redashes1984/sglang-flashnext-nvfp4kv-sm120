@@ -241,7 +241,8 @@ export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
 python3 patches/apply_nvfp4_patches.py
 git -C /opt/sglang-src/sglang apply ../patches/0001-sampler-37962-tp1-sync-skip.diff
 
-# 2. config — edit MODEL_DIR in the unit, drop YAMLs in place
+# 2. config — drop YAMLs in /opt/sglang-config, edit --model-path in the unit
+#    (hardcoded to the CT112 model dir; chat-template: in the YAMLs likewise)
 systemctl start sglang-dealignai-qwen4exp-nvfp4kv
 systemctl enable --now sglang-dealignai-nvfp4kv-warmup   # one-shot, waits for /health
 

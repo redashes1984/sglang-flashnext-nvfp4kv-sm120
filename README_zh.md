@@ -232,8 +232,9 @@ export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
 python3 patches/apply_nvfp4_patches.py
 git -C /opt/sglang-src/sglang apply ../patches/0001-sampler-37962-tp1-sync-skip.diff
 
-# 2. 配置 —— 编辑 unit 里的 MODEL_DIR（YAML 里的 ${MODEL_DIR} 需手动替换，
-#    systemd 不展开 YAML 文件内容），文件放到位
+# 2. 配置 —— YAML 放入 /opt/sglang-config，编辑 unit 里的 --model-path
+#    （现役 unit 硬编码 CT112 模型目录，YAML 里的 chat-template: 同理需改；
+#     仅 baseline unit 保留 ${MODEL_DIR} 占位符）
 systemctl start sglang-dealignai-qwen4exp-nvfp4kv
 systemctl enable --now sglang-dealignai-nvfp4kv-warmup   # one-shot，等 /health
 
