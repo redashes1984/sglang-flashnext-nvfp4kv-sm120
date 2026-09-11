@@ -85,6 +85,8 @@ history is the single source of truth. One rollup backup remains:
 sha256 `80d88f36893ef4eac69f8c84ce80814234304ab7fd8ef7b4a14eb983cf1223ab`
 (14 entries: both YAMLs, all 4 units, keep-mask, FR-Spec map, both warmups,
 expert_cold_pool.py — all md5-verified against the repo. Probe outputs are not
-archived: their numbers live in README §Fifth round and the git log). Out of
-scope and untouched: the 17 `vllm-*.bak` unit files on the same box (different
-project).
+archived: their numbers live in README §Fifth round and the git log). The 17
+`vllm-*.bak` unit files on the same box were also deleted (2026-09-11): audited
+as orphans — no vllm unit bodies exist anymore on this host (vllm moved to
+per-model CTs), zero live-path references, GPU hosts only sglang. CT112 is now
+wholly `.bak`-free.
