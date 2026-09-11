@@ -2,28 +2,28 @@
 
 English | **[简体中文](README_zh.md)**
 
-**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. Both shipped schemes are fully tuned: `nvfp4kv` (`--kv-cache-dtype nvfp4`, current mainline; the live instance runs the round-5 frozen stack: expert cold pool + per-path checkpoint cap) and `fp8kv` (`fp8_e4m3`, the rollback scheme, carrying the portable half of the same tuning). Each keeps its pre-tuning baseline under `config/baseline/` as rollback anchor and before/after evidence.**
+**Patches, deployment configs and calibration data for serving Qwen3.8-Flash-Next (180B MoE, NVFP4 weights) with `--kv-cache-dtype nvfp4` on a single RTX PRO 6000 Blackwell (96 GB, sm120) — QSA sparse attention included. Both shipped schemes are fully tuned: `nvfp4kv` (`--kv-cache-dtype nvfp4`, the capacity scheme; round-5 frozen stack: expert cold pool + per-path checkpoint cap) and `fp8kv` (`fp8_e4m3`, the LIVE default since 2026-09-11: 1M context, conc 8, and the round-6 QSA split-K that halved cold-prefill TTFT). Each keeps its pre-tuning baseline under `config/baseline/` as rollback anchor and before/after evidence.**
 
 Upstream sglang could not run NVFP4 *KV cache* together with Qwen Sparse Attention (QSA): the Triton gather path receives packed fp4 buffers and dies on `KeyError: 'float4_e2m1fn_x2'`. This repo ships the working fix (a port of the [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) patch, MIT, adapted for the SM120 trtllm-gen sparse-decode path that dspark's SM121 build never reaches), plus everything we learned tuning the result: a sampler OOM fix ([#37962](https://github.com/sgl-project/sglang/issues/37962)-class), the HiCache hard constraint, radix-cache economics under fp4 KV, and a full speculative-decoding steps calibration.
 
 Built on the groundwork of [jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) and [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) — both fp8-KV; **this repo is the nvfp4-KV datapoint** they don't have.
 
-## Results (stack generations: baseline → round-2 tuned → nvfp4kv-1m trial → expert cold pool → round-5 freeze)
+## Results (stack generations: baseline → round-2 tuned → nvfp4kv-1m trial → expert cold pool → round-5 freeze → round-6 fp8kv-1M live)
 
-| | fp8kv scheme | baseline nvfp4kv | tuned nvfp4kv (round 2) | nvfp4kv-1m trial (round 3) | **frozen stack (round 4 cold pool + round 5 cache fixes, live)** |
-|---|---|---|---|---|---|
-| KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | nvfp4 | nvfp4 | **nvfp4** |
-| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | 768K (YaRN ×3) | 1M (YaRN ×4 explicit) | **1M (YaRN ×4 explicit)** |
-| KV pool | 552,960 | 786,432 | 851,968 (+64K reclaimed mamba slots) | 1,179,648 (after funding int8 ckpt pool + boot headroom) | **2,359,296** (keep330+16 cold pool frees ~30 GB VRAM → +1.18M tokens) |
-| Concurrency | 4 | 6 | 6 | 6 | **12** (mamba 64 = 4/req × 12 + 16 anchor slack) |
-| Decode C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s warm-state | **≈122–129 tok/s** (spec-on steps=2, cold pool live; post-warmup acceptance bench 2026-09-10) |
-| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | ≈72–91 tok/s | **≈704–710 tok/s** at C12 (same acceptance harness) |
-| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s fresh-prefix; higher on radix hits | **≈9.7K tok/s** fresh-prefix; higher on radix hits |
-| MTP (NEXTN) steps | 3 | 2 | 2 (calibrated sweet spot) | OFF (steps≥1 OOMs at 1M on one GPU) | **ON, steps=2** (cold pool's freed VRAM funds spec again) |
-| Routed experts on GPU | all 512 | all 512 | all 512 | all 512 | **346/512** (330 keep + 16 dynamic slots; 166 cold experts in 24.15 GB pinned host, demand-staged) |
-| Int8 mamba ckpt pool | — | — | — | ON (patch 0002 × PLE mirrors, PR #38619) | **ON** (128 slots / 3.74 GB; per-path cap `mamba-max-states-per-path 16`, round 5) |
-| Radix prefix reuse | on | on | on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix | on | **on** — 2×549K long chains coexist, re-ask 0.9 s full hit (round 5) |
-| HiCache L2 | **off** (fail-fast vs int8 mamba ckpt, `server_args.py:6333`) | off | off | off (mandatory under fp4 KV, see Constraints) | **off** (mandatory under fp4 KV, see Constraints) |
+| | fp8kv scheme | baseline nvfp4kv | tuned nvfp4kv (round 2) | nvfp4kv-1m trial (round 3) | frozen stack (round 4 cold pool + round 5 cache fixes) | **fp8kv-1M + split-K (round 6, LIVE)** |
+|---|---|---|---|---|---|---|
+| KV cache dtype | fp8_e4m3 | nvfp4 (packed e2m1 + per-block scales) | nvfp4 | nvfp4 | nvfp4 | **fp8_e4m3** |
+| Context | 512K (YaRN ×2) | 768K (YaRN ×3) | 768K (YaRN ×3) | 1M (YaRN ×4 explicit) | 1M (YaRN ×4 explicit) | **1M (YaRN ×4 explicit)** |
+| KV pool | 552,960 | 786,432 | 851,968 (+64K reclaimed mamba slots) | 1,179,648 (after funding int8 ckpt pool + boot headroom) | 2,359,296 (keep330+16 cold pool frees ~30 GB VRAM → +1.18M tokens) | **1,651,520** = (1×1M + 2×256K working set) × 1.05 overflow slack; ≈20.3 GB, fence 4.00 GB |
+| Concurrency | 4 | 6 | 6 | 6 | 12 (mamba 64 = 4/req × 12 + 16 anchor slack) | **8** (mamba 48; side-lobe small requests ride alongside the 1M session) |
+| Decode C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s warm-state | ≈122–129 tok/s (spec-on steps=2, cold pool live) | **≈165 tok/s era**; C8 burst 616–668 tok/s aggregate (temp-0, post-split-K) |
+| Decode C6 aggregate | ≈355–365 tok/s | ~409 tok/s | ≈550–575 tok/s | ≈72–91 tok/s | ≈704–710 tok/s at C12 (same acceptance harness) | **C8 ≈428–650 tok/s** (accept 0.40–0.71 band) |
+| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s fresh-prefix; higher on radix hits | ≈9.7K tok/s fresh-prefix; higher on radix hits | **1M cold fill 133 s** (was 293 s pre-split-K, §Sixth round); 256K ≈25–28 s |
+| MTP (NEXTN) steps | 3 | 2 | 2 (calibrated sweet spot) | OFF (steps≥1 OOMs at 1M on one GPU) | ON, steps=2 (cold pool's freed VRAM funds spec again) | **ON, steps=2/draft=3** |
+| Routed experts on GPU | all 512 | all 512 | all 512 | all 512 | 346/512 (330 keep + 16 dynamic slots; 166 cold experts in 24.15 GB pinned host, demand-staged) | **346/512** (cold pool ported, same keep330+16) |
+| Int8 mamba ckpt pool | — | — | — | ON (patch 0002 × PLE mirrors, PR #38619) | ON (128 slots / 3.74 GB; per-path cap `mamba-max-states-per-path 16`, round 5) | **ON** (96 slots / 2.81 GB, cap 16) |
+| Radix prefix reuse | on | on | on — 99.96% hit, 6.3s → 0.6s on a 58K shared prefix | on | on — 2×549K long chains coexist, re-ask 0.9 s full hit (round 5) | **on** — 1M + 2×256K three chains co-resident, re-asks 0.8–2.9 s full hit |
+| HiCache L2 | **off** (fail-fast vs int8 mamba ckpt, `server_args.py:6333`) | off | off | off (mandatory under fp4 KV, see Constraints) | off (mandatory under fp4 KV, see Constraints) | **off** (int8-ckpt fail-fast) |
 
 Quality gates all green on the nvfp4 KV path: NIAH 200K, needle-in-haystack at 6×107K concurrent pool pressure, post-eviction prefix re-query correctness, grammar JSON ×6, tool calls, zero retractions, zero errors. Round-4 adds: 8448-row staging checksum byte-exact under CUDA graphs, 30-min acceptance soaks, 12×66K long-context concurrent stress — zero MISMATCH / stage_fail / OOM. Accept-len ≈2.0–2.6, accept-rate ≈0.5–0.8.
 
@@ -106,9 +106,21 @@ Honest caveats: the demand probe is torch-only (≈0.3 ms/layer/tick in eager �
 
 **Attribution correction**: this is **not** upstream #22935 (split-tombstone) — the #38625-style interior checkpoints are behavior `extra_buffer_lazy` already implements. Pure capacity economics on our side of the fence.
 
-## The fp8kv scheme (rollback stack)
+## Sixth round (2026-09-11): fp8kv promoted to LIVE + QSA indexer split-K — 1M cold TTFT 293 s → 133 s
 
-fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable half of the nvfp4kv tuning, so the two schemes swap on one GPU without losing the generic wins.
+**Promotion**: fp8kv moved from rollback stack to the live default — 1M context (YaRN ×4), KV pool 1,651,520 = (1×1M + 2×256K working set) × 1.05 overflow slack, conc 8 so Hindsight/MoviePilot side-lobe requests ride alongside the main session. Bring-up validation: NIAH@1M PASS (3 needles at 10/50/90% depth, pt=1,000,976) — closing the "YaRN×4 under fp8 KV unendorsed" caveat; three chains co-resident at 91.6% pool, all re-asks 0.8–2.9 s full hit; small requests 0.66–0.81 s at full pools; fence 4.00 GB post-capture (rollback trigger <2.5 GB → trim decode CG buckets). Probe discipline learned the hard way: NIAH must go through the chat endpoint with `enable_thinking=false` — `/generate` bare-completion feeds the whole token budget to the thinking chain and reports a false FAIL.
+
+**TTFT forensics**: a five-stage env-gated timing ledger on the live service (match exit → donate site → indexer select → attention kernel → KV gather) split the 293 s cold fill open: the sparse-attention kernel everyone expected to be the villain contributes 16 s; **the indexer's MQA logits scoring contributes ≈208 s**. Root cause is CTA starvation, not algorithmic waste: the 128 MB logits scratch budget ÷ 1 MB/row caps the late-chunk row block at 128 rows, and with `block_q=32` the tilelang kernel launches **4 CTAs against 148 SMs** — 1.6 TF/s vs the 91 TF/s the same kernel reaches when parallelized. The FLOP arithmetic closes against the measured per-chunk wall time (≈1.07 s predicted vs 1.12 s observed), which is what turned "suspect" into "proven".
+
+**Fix — split-K** (`patches/mqa_splitk.py`, idempotent, applies after the dspark patcher): the prefill MQA kernel's grid gains a y-dimension; the 64-tile key window is split across `split=64` CTAs writing disjoint logit columns (no atomics, no cross-CTA reduction; the mask kernel still scrubs out-of-window tails exactly as before). The launcher deliberately does no host-side span math — an `.item()` there would invalidate any future prefill CUDA-graph capture. Microbench scaling is near-perfect: 19.6 ms → 0.35 ms per late iteration (56×). Service-level: **1M cold fill 292.9 s → 133.3 s (−54.5%)**, 517K 80.1 → 58.9 s, 549K 89 → 62–66 s; NIAH@1M still PASS; C8 burst 616–668 tok/s (temp-0, 5 reps) with no regression vs the split=1 control (578–634); concurrent prefill+decode slightly *better* (117 vs 102 tok/s aggregate); fence unchanged at 4.00 GB.
+
+**Silent-rot audit** (the failure mode this patch could hide: no crash, no error counter, wrong top-k picks): ① bitwise gate — split=64 self-replay (temporal determinism, kills overlapping-CTA write races) + split=64-vs-split=1 + split=32 cross-check across 9 production shape classes (early budget-full r4096, interleaved multi-seq windows, full-window, degenerate r1, non-64-aligned windows, multi-batch 4×1024): **all bitwise equal**; ② 45-min fresh-doc soak (67 iterations, indexer windows sweeping 45K→250K depth continuously, unique-answer NIAH + determinism + smoke): **zero violations, zero service errors**; ③ the `return_indexer_topk` capture route was probed and is a dead end on this architecture (the capturer's `num_indexer_layers` is DSA/DSv4-only config; it self-disables here) — end-to-end soak replaces it. Two falsified hypotheses died along the way (triton sparse-GQA config table: ±1% across all configs; "kernel already saturated": an artifact of shape-poisoned microbenchmarks — causal masking, random-start padding, and unfaithful launch geometry each inflate or deflate by 4–30×; the ledger arithmetic is the lie detector).
+
+**fp8kv is now the capacity+latency sweet spot**; nvfp4kv stays stopped as the conc-12 fallback (same patched tree, so split-K activates on its next bring-up).
+
+## The fp8kv scheme (LIVE default since 2026-09-11)
+
+fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable half of the nvfp4kv tuning, on 09-11 it took the round-5 cap16 + cold pool, and that same day it was promoted to the live scheme with 1M context and the round-6 QSA split-K (§Sixth round). The two schemes swap on one GPU; nvfp4kv remains the conc-12 capacity fallback.
 
 | Item | fp8kv state | Why |
 |---|---|---|
@@ -118,13 +130,16 @@ fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable
 | FR-Spec 64K hot map | ported, same `.pt` | The map is tokenizer-scoped, not KV-dtype-scoped |
 | extra_buffer_lazy (CLI-only alias) | ported | Same slot economics |
 | int8 mamba ckpt + `mamba-max-states-per-path 16` | added (round 5, CLI flags) | Same donate-storm fix; fp8kv's old 3×336K all-miss case belongs to this family (96-slot pool, ~82 ckpt/chain uncapped) |
+| QSA prefill-MQA split-K | **added (round 6, `patches/mqa_splitk.py`)** | Indexer CTA starvation at late depths (4 CTAs / 148 SMs); split=64 → 56× kernel scaling, 1M cold TTFT −54.5%, bitwise-verified silent-rot clean |
 | MTP steps | 3 → **2** (round-4 A/B) | steps2 won concurrency (C4 aggregate 431–438 tok/s); the 09-08 "keep 3" reading is superseded |
-| KV pool | 552,960 → **1,310,720** | B+ rung: 2× full 524K chains co-resident — the expert cold pool migrated to fp8kv too, funding it |
+| Context | 512K → **1M** (YaRN ×2 → ×4, round 6) | NIAH@1M PASS under fp8 KV closes the endorsement gap; 2×1M co-existence rejected (would fence-strike at 1.75 GB) |
+| KV pool | 552,960 → 1,310,720 (round 4 B+) → **1,651,520** | (1×1M + 2×256K working set) × 1.05 overflow slack; 64-page aligned; pool ≈20.3 GB at 12,288 B/token (QSA: fp8 KV on 12 full-attn layers only) |
+| Concurrency | 4 → **8** (round 6) | side-lobe Hindsight/MoviePilot small requests ride alongside the main 1M session; mamba 8×4=32 ≤ 48−16 slack fits |
 | mamba cache | 24 → **48** | anchor-slot ladder; int8 pool auto-sizes 2× (96 slots) |
 | HiCache L2 | **OFF** | Upstream fail-fast against int8 mamba checkpoints (`server_args.py:6333`) — same-side trade as nvfp4kv's #36121 ban |
 | Expert cold pool | added (round 4+) | `switch_fp8kv_coldpool.sh`, same keep330+16 staging as nvfp4kv |
 
-Hot-state (round-4 era): fp8kv at steps=2 runs C4 aggregate ≈431–438 tok/s (the A/B winner; steps=3 measured slower under concurrency despite deeper accept chains). Both schemes share one GPU and are mutually exclusive — since 2026-09-10 fp8kv sits stopped (nvfp4kv live; fp8kv in `failed` state after a manual KILL, so cap16 activates on its next bring-up). Pick fp8kv for latency-sensitive single-stream work; pick nvfp4kv when context capacity matters. Same port, same served-model-name — swapping = stop one unit, start the other. Rollback anchor: the fp8kv pair in `config/baseline/`.
+Live state (round 6, 2026-09-11): C8 burst 616–668 tok/s temp-0 (5 reps), accept 0.40–0.71 band; concurrent C8×172K-cold-prefill 117 tok/s aggregate; small-req p50 ≈0.49 s under full pools; 1M cold fill 133 s / re-ask 2.9 s; fence 4.00 GB. Both schemes share one GPU and are mutually exclusive — swapping = stop one unit pair, start the other (`systemctl stop ... && nvidia-smi` confirm 0 before start). Same port, same served-model-name — downstream routers key on `Qwen3.8-Flash-Next-NVFP4` regardless of which scheme answers. Rollback anchor: the fp8kv pair in `config/baseline/`.
 
 ## Why nvfp4 KV
 
@@ -143,6 +158,12 @@ patches/
   0002-mamba-ckpt-ple.diff   int8 mamba checkpoint pool mirrors PLE side states
                              (short-conv bf16 / ngram int64 rows) instead of the
                              upstream ValueError guard. Upstream PR #38619.
+  mqa_splitk.py              round-6 idempotent patcher: QSA prefill-MQA split-K
+                             (grid.y=64 disjoint key-tile ranges; kills the 4-CTA
+                             late-chunk starvation, 1M cold TTFT -54.5%). Apply
+                             AFTER apply_nvfp4_patches.py; bitwise-verified vs
+                             split=1 (tests/gateA2). Rollback anchor: pristine
+                             mqa.py = base tarball (MANIFEST md5 813f5d65…).
   expert_tier.py             v1 swap-in prototype — kept VERBATIM as the failure
                              baseline (corrupted output after ~10 min of traffic);
                              source of the R1-R3 red lines in expert_cold_pool.py
@@ -157,7 +178,14 @@ config/
                                     decode CG bs[1,2,4,6,8,10,12] / prefill CG disabled
   expert_keep_330_final.json        per-layer keep-set (48 × 330 global expert ids) from the
                                     router-frequency census — cold pool's arm input
-  dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme — rollback stack (conc4 / 512K / MTP steps=2 / mamba48 + per-path cap 16 / int8 ckpt ON / HiCache OFF / KV pool 1310720 / expert cold pool; 2026-09-08 portable port + round-4 steps2 A/B + round-5 cached0 cap)
+  dealignai-qwen4exp-fp8kv.yaml     fp8 KV scheme — ROUND 6 LIVE (current): conc8 /
+                                    1M (YaRN×4) / MTP steps=2 / mamba48 + per-path cap 16 /
+                                    int8 ckpt ON (96 slots) / HiCache OFF /
+                                    KV pool 1651520 = (1M+2×256K)×1.05 / expert cold pool /
+                                    decode CG bs[1,2,4,6,8] / unit carries --enable-int8-mamba-checkpoint
+                                    --mamba-max-states-per-path 16; source tree adds mqa_splitk.py
+                                    (portable ports 09-08 + round-4 steps2 A/B + round-5 cap +
+                                    round-6 1M/split-K)
   baseline/                         Pre-tuning BASELINE snapshots for BOTH schemes, kept as
                                     rollback points and before/after evidence:
                                     nvfp4kv — mamba32 auto-sized, KV pool 786432, no FR-Spec map,
@@ -189,6 +217,13 @@ scripts/
   warmup_qsa_nvfp4kv.py       closes the late-device-load OOM window (long prefill,
                               grammar bitmask, bs6 graph buckets) before real traffic
   warmup_qsa_fp8kv.py         fp8 variant (prefix-cache hit path)
+  bench_qsa_mqa_split3.py      round-6 split-K starvation proof: production late
+                              geometry (rows=128 win=244K), 56× near-linear scaling
+  bench_qsa_configs.py         falsification record: triton sparse-GQA config table
+                              sweep (±1% — NOT the lever; don't chase it)
+  bench_qsa_mqa_tiles.py       falsification record: window-shape microbench with
+                              random starts (pathological padding — the lesson)
+  probe_qsa_saturation.py      falsification record: shape-poisoned saturation probe
 tests/
   test_cold_pool_logic.py    CPU logic tests T1–T9 for the cold pool (shrink+stage+
                              remap+bias, packed remap, demand stash, weak-demand
@@ -199,6 +234,20 @@ tests/
   probe_highwater_77.py      3×495K high-water probe (cold fill + A/B/C re-asks)
   probe_g2x.py / probe_nvfp4_mamba_gate.py
                              mamba-slot / anchor-gate probes (G2X: 3×233K all-hit)
+  probe_fp8kv_1m_bringup.py  round-6 bring-up: 1M cold + reask + NIAH + side chains
+  gateA_mqa_bitwise.py       round-6 bitwise gate: split=64 vs split=1 logits,
+                             production late/mid shapes, seeded (service-off)
+  gateA2_mqa_bitwise_extended.py
+                             extended bitwise lattice: 9 shape classes ×
+                             (self-replay determinism + cross-split + split32)
+  gateB_indexer_canary.py    indexer-topk capture probe — documents the dead end
+                             (capturer self-disables on this arch); kept as the
+                             negative result + the meta_info field dump
+  gateD_quality_splitk.py    end-to-end: grammar / mid-doc branch / tool-call
+  soak_splitk2.sh / battery.sh / c8rep.sh
+                             remote (/opt/sglang-test): fresh-doc silent-rot soak
+                             (67 iters, zero violations), A/B QoS battery,
+                             5-rep temp-0 burst protocol
 docs/
   RESULTS.md                  full stress matrix, MTP steps 1–3 calibration table,
                               mamba slot economics, every dead-end and root cause
@@ -227,6 +276,7 @@ bootstrap/
 9. **A keep-masked router cannot feed its own demand signal.** Cold experts are `-inf`-masked, so selection-path demand is structurally zero and the pool starves forever (observed: 30 min traffic, staged=0). Demand must be probed from raw **pre-mask** logits in the alpha band. Related trap class: any stash-buffer slice read before refill must be `.clone()`d — a view erased by `fill_` silently killed the strong-demand filter in v1 of the probe.
 10. **Spec-decoding drafts share the decoder `layer_id` namespace in-process.** The NEXTN draft model is the same class with `num_hidden_layers=1` → its layer 0 collides with target layer 0. Any per-layer runtime mechanism (mask, remap, stats) gated on `layer_id` alone will silently hijack drafts — gate on **object identity** of the module's TopKConfig registered at arm time (v2.9; symptom was accept rate 0.21 with drafts masked+remapped).
 11. **Under `extra_buffer_lazy` + int8 mamba checkpoints, prefix reuse is capped by the checkpoint pool, not the KV tree.** Chunked prefill donates one int8 checkpoint per 4096-token chunk; with the default per-path cap of −1, a single 549K chain eats ≈134 of the 128 pool slots, so two chains evict each other into `cached=0` (tree and KV pages present, match dead). `--mamba-max-states-per-path 16` is the zero-VRAM fix, on both schemes; the re-ask cliff (89 s → 0.9 s) is the proof. Upstream #22935 looks similar but is a different family (`no_buffer`) — don't chase its split-tombstone fix.
+12. **At 1M depth the cold-prefill bottleneck is the QSA indexer's CTA geometry, not the sparse-attention kernel.** The 128 MB logits scratch budget caps late row blocks at 128 rows; with `block_q=32` the tilelang MQA kernel launches 4 CTAs against 148 SMs (1.6 TF/s vs 91 TF/s parallelized) — ≈208 s of a 293 s cold fill. Split-K over key tiles (grid.y=64, disjoint column writes, mask kernel unchanged) halves TTFT (→133 s) and is bitwise-identical to split=1 across 9 production shape classes. Two traps on the way there: microbenchmark shapes must be production-faithful (causal masking, contiguous starts, real launch geometry each distort by 4–30×), and any probe that syncs inside the model forward path invalidates CUDA-graph capture and kills boot (`cudaErrorStreamCaptureInvalidated`) — gate on `is_current_stream_capturing()`.
 
 ## Reproduce
 
@@ -239,12 +289,19 @@ export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
 
 # 1. patches (idempotent; re-run after any source sync)
 python3 patches/apply_nvfp4_patches.py
-git -C /opt/sglang-src/sglang apply ../patches/0001-sampler-37962-tp1-sync-skip.diff
+# 0001/0002 are raw diffs with DIFFERENT path prefixes — strip level depends on
+# cwd; these combos are path-verified (git apply --check resolves both targets):
+git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0001-sampler-37962-tp1-sync-skip.diff   # paths: python/sglang/…
+git -C /opt/sglang-src          apply -p1 /path/to/repo/patches/0002-mamba-ckpt-ple.diff               # paths: sglang/python/sglang/…
+# (equivalently from the package root: 0002 with -p2 — what bootstrap/MANIFEST.md gold-standard used)
+python3 patches/mqa_splitk.py        # round 6: QSA indexer split-K (after the patcher)
 
 # 2. config — drop YAMLs in /opt/sglang-config, edit --model-path in the unit
 #    (hardcoded to the CT112 model dir; chat-template: in the YAMLs likewise)
-systemctl start sglang-dealignai-qwen4exp-nvfp4kv
-systemctl enable --now sglang-dealignai-nvfp4kv-warmup   # one-shot, waits for /health
+systemctl start sglang-dealignai-qwen4exp-fp8kv        # round-6 LIVE scheme
+systemctl enable --now sglang-dealignai-fp8kv-warmup  # one-shot, waits for /health
+# capacity fallback (single-GPU mutex — stop fp8kv first):
+#   systemctl start sglang-dealignai-qwen4exp-nvfp4kv + its warmup unit
 
 # 3. (round 4, optional) expert cold pool — overlay tree + hooks + keep-set + env
 cp -a /opt/sglang-src /opt/sglang-patch            # fork isolation, pinned base commit
@@ -275,8 +332,8 @@ The nvfp4 KV path is gated entirely by `kv-cache-dtype: nvfp4` — flip it back 
 
 ## Constraints & honest caveats
 
-- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-5 frozen live state: cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / per-path ckpt cap 16 (int8 pool 128 slots) / KV pool 2,359,296 / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
-- Finalized fp8kv stack (2026-09-11 1M upgrade): portable items ported (§The fp8kv scheme), MTP steps=2 (round-4 A/B), HiCache OFF (int8-ckpt fail-fast), conc4 / **YaRN×4 1M** / **KV pool 1,651,520 = (1×1M + 2×256K) × 1.05 overflow slack** (pool ≈20.3 GB, fence ≈4.2 GB post-boot — same ice as nvfp4kv's 5.29) / mamba 48 + cap 16 / expert cold pool. 2×1M co-existence rejected: needs 25.77 GB, would fence-strike at 1.75 GB. **Bring-up gate: YaRN×4 under fp8 KV has no NIAH endorsement yet — run NIAH@1M before trusting.** Currently stopped (single-card mutex, nvfp4kv live). Rollback = its own `config/baseline/` pair over the current files.
+- Finalized tuned stack (round 2, memory knobs superseded by round 3): GDN flashinfer both ends, mamba pinned 24, extra_buffer_lazy (CLI-only alias), SAM=decode. Round-3 state: ctx 1M / YaRN ×4 explicit / spec OFF / KV pool 1,179,648 / int8 ckpt ON via patch 0002 overlay. **Round-5 frozen stack (nvfp4kv standby since round 6): cold pool keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / per-path ckpt cap 16 (int8 pool 128 slots) / KV pool 2,359,296 / decode CG bs[1,2,4,6,8,10,12].** Hot-state round 4: C1 ≈122–129 / C12 aggregate ≈704–710 / prefill ≈9.7K fresh-prefix (post-warmup acceptance bench, steps=2/draft3; supersede earlier warm-cache-window figures 146–171 / 773–825). Rollback: `switch_coldpool.sh off`, or copy `config/baseline/` files over the current ones and restart the unit.
+- Finalized fp8kv stack (round 6, LIVE): portable items ported (§The fp8kv scheme), MTP steps=2 (round-4 A/B), HiCache OFF (int8-ckpt fail-fast), conc **8** / **YaRN×4 1M** / **KV pool 1,651,520 = (1×1M + 2×256K) × 1.05 overflow slack** (pool ≈20.3 GB, **fence 4.00 GB measured post-capture** — rollback trigger <2.5 GB → trim decode CG buckets to [1,2,4,6]) / mamba 48 + cap 16 / expert cold pool / **QSA split-K** (1M cold TTFT 133 s). 2×1M co-existence rejected: needs 25.77 GB, would fence-strike at 1.75 GB. NIAH@1M endorsement: **PASS** (round-6 bring-up, chat endpoint + `enable_thinking=false`). Currently live; nvfp4kv stopped as conc-12 fallback. Rollback = its own `config/baseline/` pair over the current files.
 - Single consumer GPU + 44 GB pinned PLE table: the nvfp4kv and fp8kv schemes are mutually exclusive; expect ~4-5 min cold start (round 4 adds ~3.5 min weight load + shrink). The unit deliberately ships unenabled to avoid boot-time GPU contention.
 - Round-4 host-RAM budget is tight by design: 24.15 GB cold-pool pins + 64 GB PLE pinned table (power-of-two rounded from 47.7 GB — a `file`-backend A/B is deferred) on a 112 GB box → MemAvailable ~20 GB under soak. Watch `Shmem` and swap before adding any more pinned consumers.
 - C1 decode with the cold pool + spec (≈122–129) sits just below fp8kv (≈165) — the round-3 "fp4 KV is slower" gap was mostly the spec-off tax, not gather-dequant alone. Upstream native fp4 QSA decode pools (#37798) remain the path to close or invert the gap.

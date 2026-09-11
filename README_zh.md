@@ -2,28 +2,28 @@
 
 [English](README.md) | **简体中文**
 
-**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，现役主线；线上实例跑第五轮定档栈：专家冷池 + 每路径 checkpoint 帽）与 `fp8kv`（`fp8_e4m3`，回滚方案，吸收了同一批调优中可移植的一半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
+**在单张 RTX PRO 6000 Blackwell（96 GB，sm120）上跑通 Qwen3.8-Flash-Next（180B MoE，NVFP4 权重）的补丁、部署配置与校准数据 —— 含 QSA 稀疏注意力。两套方案都已完成调优：`nvfp4kv`（`--kv-cache-dtype nvfp4`，容量兜底方案；第五轮定档栈：专家冷池 + 每路径 checkpoint 帽）与 `fp8kv`（`fp8_e4m3`，**2026-09-11 起现役默认**：1M 上下文、并发 8、第六轮 QSA split-K 把冷灌 TTFT 砍半）。各方案的调优前基准快照保留在 `config/baseline/`，作回滚锚点与前后对照证据。**
 
 上游 sglang 无法让 NVFP4 *KV cache* 与 Qwen 稀疏注意力（QSA）共存：Triton gather 路径拿到的是打包 fp4 缓冲区，直接死在 `KeyError: 'float4_e2m1fn_x2'`。本仓库给出可用的修复（移植自 [dspark](https://github.com/Olyno/Qwen3.8-Flash-Next-Dual-DGX-Sparks) 的 MIT 补丁，并针对 dspark 的 SM121 环境根本走不到的 SM120 trtllm-gen 稀疏解码路径做了适配），外加整套调优经验：sampler OOM 修复（[#37962](https://github.com/sgl-project/sglang/issues/37962) 同类问题）、HiCache 硬性约束、fp4 KV 下的 radix cache 经济学、完整的投机解码 steps 校准。
 
 前作基础：[jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) 与 [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) —— 两家都是 fp8-KV；**本仓库补上的是他们没有的 nvfp4-KV 数据点**。
 
-## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版 → 专家冷池 → 第五轮定档）
+## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版 → 专家冷池 → 第五轮定档 → 第六轮 fp8kv-1M 现役）
 
-| | fp8kv 方案 | nvfp4kv 基准版 | nvfp4kv 二次调优版 | nvfp4kv-1m 试验版（第三轮） | **定档栈（第四轮冷池 + 第五轮缓存修复，现役）** |
-|---|---|---|---|---|---|
-| KV cache 类型 | fp8_e4m3 | nvfp4（打包 e2m1 + 分块 scale） | nvfp4 | nvfp4 | **nvfp4** |
-| 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | 768K（YaRN ×3） | 1M（YaRN ×4 显式） | **1M（YaRN ×4 显式）** |
-| KV 池 | 552,960 | 786,432 | 851,968（回收 mamba 槽 +64K） | 1,179,648（为 int8 ckpt 池腾资 + 启动余量后） | **2,359,296**（keep330+16 冷池腾出 ~30GB 显存 → +118 万 token） |
-| 并发 | 4 | 6 | 6 | 6 | **12**（spec 下 4 槽/请求 ×12 + 16 锚点余量 → mamba 64） |
-| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s（热态） | **≈122–129 tok/s**（spec-on steps=2 + 冷池在线；2026-09-10 预热后验收 bench） |
-| 解码聚合 | ≈355–365 tok/s（C6） | ~409 tok/s（C6） | ≈550–575 tok/s（C6） | ≈72–91 tok/s（C6） | **≈704–710 tok/s（C12，同 harness）** |
-| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s（冷前缀；radix 命中更高） | **≈9.7K tok/s**（冷前缀；radix 命中更高） |
-| MTP（NEXTN）steps | 3 | 2 | 2（校准甜点） | OFF（1M 单卡下 steps≥1 即 OOM） | **开，steps=2**（冷池腾出的显存重新养得起投机） |
-| GPU 常驻路由专家 | 全部 512 | 全部 512 | 全部 512 | 全部 512 | **346/512**（330 keep + 16 动态槽；166 个冷专家进 24.15 GB pinned 内存，按需求搬运） |
-| Int8 mamba ckpt 池 | — | — | — | 开（补丁 0002 × PLE 镜像，PR #38619） | **开**（128 槽 / 3.74 GB；每路径帽 `mamba-max-states-per-path 16`，第五轮） |
-| Radix 前缀复用 | 开 | 开 | 开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s | 开 | **开** —— 2×549K 长链共存，重问 0.9s 全命中（第五轮） |
-| HiCache L2 | **关**（与 int8 mamba ckpt fail-fast，`server_args.py:6333`） | 关 | 关 | 关（fp4 KV 硬约束，见约束一节） | **关**（fp4 KV 硬约束，见约束一节） |
+| | fp8kv 方案 | nvfp4kv 基准版 | nvfp4kv 二次调优版 | nvfp4kv-1m 试验版（第三轮） | 定档栈（第四轮冷池 + 第五轮缓存修复） | **fp8kv-1M + split-K（第六轮，现役）** |
+|---|---|---|---|---|---|---|
+| KV cache 类型 | fp8_e4m3 | nvfp4（打包 e2m1 + 分块 scale） | nvfp4 | nvfp4 | nvfp4 | **fp8_e4m3** |
+| 上下文 | 512K（YaRN ×2） | 768K（YaRN ×3） | 768K（YaRN ×3） | 1M（YaRN ×4 显式） | 1M（YaRN ×4 显式） | **1M（YaRN ×4 显式）** |
+| KV 池 | 552,960 | 786,432 | 851,968（回收 mamba 槽 +64K） | 1,179,648（为 int8 ckpt 池腾资 + 启动余量后） | 2,359,296（keep330+16 冷池腾出 ~30GB 显存 → +118 万 token） | **1,651,520** =（1×1M + 2×256K 工作集）× 1.05 防溢出余量；≈20.3 GB，fence 4.00 GB |
+| 并发 | 4 | 6 | 6 | 6 | 12（spec 下 4 槽/请求 ×12 + 16 锚点余量 → mamba 64） | **8**（mamba 48；侧翼小请求与 1M 主会话并行） |
+| 解码 C1 | ≈165 tok/s | ~122 tok/s | ≈136 tok/s | ≈75–90 tok/s（热态） | ≈122–129 tok/s（spec-on steps=2 + 冷池在线） | **≈165 tok/s 档**；C8 burst 616–668 tok/s 聚合（temp-0，split-K 后） |
+| 解码聚合 | ≈355–365 tok/s（C6） | ~409 tok/s（C6） | ≈550–575 tok/s（C6） | ≈72–91 tok/s（C6） | ≈704–710 tok/s（C12，同 harness） | **C8 ≈428–650 tok/s**（accept 0.40–0.71 波动带） |
+| Prefill | ~11K tok/s | ~10K tok/s | ≈10K tok/s | ≈9.7K tok/s（冷前缀；radix 命中更高） | ≈9.7K tok/s（冷前缀；radix 命中更高） | **1M 冷灌 133 s**（split-K 前 293 s，见第六轮）；256K ≈25–28 s |
+| MTP（NEXTN）steps | 3 | 2 | 2（校准甜点） | OFF（1M 单卡下 steps≥1 即 OOM） | 开，steps=2（冷池腾出的显存重新养得起投机） | **开，steps=2/draft=3** |
+| GPU 常驻路由专家 | 全部 512 | 全部 512 | 全部 512 | 全部 512 | 346/512（330 keep + 16 动态槽；166 个冷专家进 24.15 GB pinned 内存，按需求搬运） | **346/512**（冷池已移植，同款 keep330+16） |
+| Int8 mamba ckpt 池 | — | — | — | 开（补丁 0002 × PLE 镜像，PR #38619） | 开（128 槽 / 3.74 GB；每路径帽 `mamba-max-states-per-path 16`，第五轮） | **开**（96 槽 / 2.81 GB，帽 16） |
+| Radix 前缀复用 | 开 | 开 | 开 —— 58K 共享前缀命中 99.96%，6.3s → 0.6s | 开 | 开 —— 2×549K 长链共存，重问 0.9s 全命中（第五轮） | **开** —— 1M + 2×256K 三链共存，重问 0.8–2.9s 全命中 |
+| HiCache L2 | **关**（与 int8 mamba ckpt fail-fast，`server_args.py:6333`） | 关 | 关 | 关（fp4 KV 硬约束，见约束一节） | 关（fp4 KV 硬约束，见约束一节） | **关**（int8-ckpt fail-fast） |
 
 nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 needle 测试、驱逐后前缀重查正确性、grammar JSON ×6、工具调用、零 retract、零报错。第四轮追加：CUDA graph 下 8448 行搬运校验逐字节一致、30 分钟验收 soak、12×66K 长文并发压测 —— 零 MISMATCH / stage_fail / OOM。accept len ≈2.0–2.6，accept rate ≈0.5–0.8。
 
@@ -106,9 +106,21 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 **归因修正**：这不是上游 #22935（split 墓碑）—— #38625 式 interior checkpoint 正是 `extra_buffer_lazy` 已有的行为。纯粹是我们这边的池容量经济学。
 
-## fp8kv 方案（回滚栈）
+## 第六轮（2026-09-11）：fp8kv 升现役 + QSA indexer split-K —— 1M 冷灌 TTFT 293s → 133s
 
-fp8kv 不是原始旧配置 —— 2026-09-08 它吸收了 nvfp4kv 调优中可移植的一半，两方案同卡互换不丢通用收益。
+**升职**：fp8kv 从回滚栈升为现役默认 —— 1M 上下文（YaRN ×4）、KV 池 1,651,520 =（1×1M + 2×256K 工作集）× 1.05 防溢出余量、并发 8 让 Hindsight/MoviePilot 侧翼小请求与主会话并行。开机验证：NIAH@1M 通过（10/50/90% 深度三针全中，pt=1,000,976）—— "YaRN×4 在 fp8 KV 下缺背书"这条悬案就此了结；三链共存驻留 91.6% 池，重问 0.8–2.9s 全命中；满池下小请求 0.66–0.81s；capture 后 fence 实测 4.00 GB（回退触发线 <2.5 GB → 砍 decode CG 桶到 [1,2,4,6]）。探针纪律是踩坑换来的：NIAH 必须走 chat 端点 + `enable_thinking=false` —— `/generate` 裸补全会把 token 预算全喂给思考链，报出假 FAIL。
+
+**TTFT 取证**：现役服务上挂五段 env 门控计时账本（match 出口 → donate 点 → indexer select → 注意力 kernel → KV gather），把 293s 冷灌拆开：人人喊打的稀疏注意力 kernel 只占 16s；**indexer 的 MQA logits 打分占 ≈208s**。根因是 CTA 饥饿不是算法浪费：128MB logits 暂存预算 ÷ 1MB/行把晚期行块钳到 128 行，`block_q=32` 下 tilelang kernel 只开 **4 个 CTA 对阵 148 个 SM** —— 1.6 TF/s，而同一 kernel 并行化后能跑 91 TF/s。FLOP 算术与实测逐 chunk 时长闭合（预测 ≈1.07s vs 实测 1.12s），这是"嫌疑"变"实锤"的地方。
+
+**修复 —— split-K**（`patches/mqa_splitk.py`，幂等，跑在 dspark patcher 之后）：prefill MQA kernel 的 grid 加 y 维，64 瓦片的键窗口切给 `split=64` 个 CTA 各写不相交的 logits 列（无原子操作、无跨 CTA 归约；mask kernel 照常兜尾部越界）。launcher 故意不做任何 host 侧数学 —— 一个 `.item()` 就会废掉未来 prefill CUDA-graph capture。微基准近完美线性：晚期单次迭代 19.6ms → 0.35ms（56×）。服务级：**1M 冷灌 292.9s → 133.3s（-54.5%）**，517K 80.1→58.9s，549K 89→62–66s；NIAH@1M 依旧 PASS；C8 burst 616–668 tok/s（temp-0，5 轮）对 split=1 对照组（578–634）无回归；并发预灌+解码反而更好（聚合 117 vs 102 tok/s）；fence 4.00 GB 不变。
+
+**静默腐化审计**（本补丁可能藏的事故模式：不崩、零报错、topk 选错、模型自信答错）：① 逐比特门 —— split=64 自对拍（时间决定论，专杀重叠 CTA 竞态写）+ split=64 vs split=1 + split=32 交叉，覆盖 9 个生产形状类（早期满预算 r4096、多序列交错窗口、全窗、r1 退化、非 64 整除窗、多批 4×1024）：**全部逐比特相等**；② 45 分钟新鲜文档 soak（67 轮，indexer 窗口在 45K→250K 深度连续扫，唯一答案 NIAH + 决定论 + 冒烟）：**零违例、服务零报错**；③ `return_indexer_topk` 采集路线在本架构探过即死（capturer 的 `num_indexer_layers` 是 DSA/DSv4 专属配置，本模型自动禁用）—— 端到端 soak 顶替其职能。路上还枪毙了两个假设（triton sparse-GQA 配置表：全配置 ±1%；"kernel 已饱和"：形状中毒微基准的产物 —— 因果掩码、随机起点 padding、失真 launch 几何各自能扭曲 4–30 倍；账目算术是测谎仪）。
+
+**fp8kv 就此成为容量+延迟双甜点位**；nvfp4kv 停机留作 conc-12 容量兜底（同一份打过补丁的源码树，split-K 在其下次启动自动生效）。
+
+## fp8kv 方案（2026-09-11 起现役默认）
+
+fp8kv 不是原始旧配置 —— 2026-09-08 吸收 nvfp4kv 可移植的一半调优，09-11 吃进第五轮 cap16 + 冷池，同日升为现役并带上 1M 上下文与第六轮 QSA split-K（见第六轮）。两方案同卡互换，nvfp4kv 留作 conc-12 容量兜底。
 
 | 项 | fp8kv 状态 | 理由 |
 |---|---|---|
@@ -118,17 +130,20 @@ fp8kv 不是原始旧配置 —— 2026-09-08 它吸收了 nvfp4kv 调优中可�
 | FR-Spec 64K 热表 | 已移植，共用同一 `.pt` | 表按 tokenizer 建，与 KV 类型无关 |
 | extra_buffer_lazy（别名参数走 CLI） | 已移植 | 槽经济学相同 |
 | int8 mamba ckpt + `mamba-max-states-per-path 16` | 已加（第五轮，CLI flag） | 同款 donate 风暴修复；fp8kv 旧 3×336K 全 miss 案属本病族（96 槽池，无帽时 ~82 份/链） |
+| QSA prefill-MQA split-K | **已加（第六轮，`patches/mqa_splitk.py`）** | 晚期 indexer CTA 饥饿（4 CTA / 148 SM）；split=64 → 56× kernel 加速、1M 冷灌 TTFT -54.5%，逐比特审计静默腐化零违例 |
 | MTP steps | 3 → **2**（第四轮 A/B） | steps2 并发胜出（C4 聚合 431–438 tok/s）；09-08 的「保持 3」结论已被取代 |
-| KV 池 | 552,960 → **1,310,720** | B+ 台阶：2× 完整 524K 链共存 —— 专家冷池同步移植到 fp8kv 为其腾资 |
+| 上下文 | 512K → **1M**（YaRN ×2 → ×4，第六轮） | NIAH@1M PASS 补上 fp8 KV 下的背书缺口；2×1M 双开被否决（fence 会砸到 1.75 GB） |
+| KV 池 | 552,960 → 1,310,720（第四轮 B+）→ **1,651,520** | （1×1M + 2×256K 工作集）× 1.05 防溢出余量；64 页对齐；池 ≈20.3 GB @ 12,288 B/token（QSA：fp8 KV 只存 12 个 full-attn 层） |
+| 并发 | 4 → **8**（第六轮） | 主 1M 会话进行时并行吃 Hindsight/MoviePilot 小请求；mamba 8×4=32 ≤ 48−16 余量成立 |
 | mamba cache | 24 → **48** | 锚槽阶梯；int8 池自动 2×（96 槽） |
 | HiCache L2 | **关** | 上游对 int8 mamba checkpoint fail-fast（`server_args.py:6333`）—— 与 nvfp4kv 的 #36121 禁令同侧取舍 |
 | 专家冷池 | 已加（第四轮+） | `switch_fp8kv_coldpool.sh`，与 nvfp4kv 同款 keep330+16 搬运 |
 
-热态实测（第四轮时代）：fp8kv steps=2 下 C4 聚合 ≈431–438 tok/s（A/B 胜者；steps=3 在并发下反而更慢，尽管接受链更深）。两方案共享单卡互斥 —— 2026-09-10 起 fp8kv 处于停止态（nvfp4kv 现役；fp8kv 因手动 KILL 处于 `failed`，cap16 在其下次拉起时自然生效）。单流延迟敏感选 fp8kv，长上下文容量优先选 nvfp4kv。同端口、同 served-model-name，互换 = 停一个 unit 起另一个。回滚锚点：`config/baseline/` 里的 fp8kv 同名对。
+现役实测（第六轮，2026-09-11）：C8 burst 616–668 tok/s temp-0（5 轮），accept 0.40–0.71 带；并发 C8×172K 冷灌聚合 117 tok/s；满池小请求 p50 ≈0.49s；1M 冷灌 133s / 重问 2.9s；fence 4.00 GB。两方案共享单卡互斥 —— 互换 = 停一对 unit 起另一对（`systemctl stop … && nvidia-smi` 确认归零再 start）。同端口、同 served-model-name —— 下游路由不管哪套方案应答都认 `Qwen3.8-Flash-Next-NVFP4`。回滚锚点：`config/baseline/` 里的 fp8kv 同名对。
 
 ## 为什么要 nvfp4 KV
 
-fp4 KV 池把 KV 显存砍半（打包 e2m1 + 很小的分块 scale）。在 96 GB 卡上，这是 conc 12 下 1M 上下文能成立的前提 —— 权重、~44 GB 的 PLE n-gram pinned 表、CUDA graph 把其他显存全吃光了。gather-dequant 的单流代价是固有的（每步多两次 Triton launch + 一次反量化 kernel）；第四轮冷池腾出的显存重新养得起投机（steps=2 下 C1 ≈122–129 tok/s），第三、五轮的 checkpoint 池才真正给足了大量不同长前缀的驱逐余量。要裸解码速度选 fp8kv（512K），要上下文容量选 nvfp4kv。
+fp4 KV 池把 KV 显存砍半（打包 e2m1 + 很小的分块 scale）。在 96 GB 卡上，这是 conc 12 下 1M 上下文能成立的前提 —— 权重、~44 GB 的 PLE n-gram pinned 表、CUDA graph 把其他显存全吃光了。gather-dequant 的单流代价是固有的（每步多两次 Triton launch + 一次反量化 kernel）；第四轮冷池腾出的显存重新养得起投机（steps=2 下 C1 ≈122–129 tok/s），第三、五轮的 checkpoint 池才真正给足了大量不同长前缀的驱逐余量。第六轮之后格局更新：fp8kv 拿到 1M + split-K 后成为现役默认（单流 ≈165 tok/s + 侧翼并发 8），nvfp4kv 留作需要 12 路长链并发时的容量兜底。
 
 ## 目录结构
 
@@ -143,19 +158,32 @@ patches/
   0002-mamba-ckpt-ple.diff   int8 mamba checkpoint 池镜像 PLE side states
                              （short-conv bf16 / ngram int64 行），取代上游的
                              ValueError 守卫。对应上游 PR #38619。
+  mqa_splitk.py              第六轮幂等 patcher：QSA prefill-MQA split-K
+                             （grid.y=64 键瓦片均分互斥列区间；杀掉晚期 4-CTA
+                             饥饿，1M 冷灌 TTFT -54.5%）。跑在 apply_nvfp4_patches
+                             之后；与 split=1 逐比特对拍验证（tests/gateA2）。
+                             回滚锚：原始 mqa.py = 基线 tarball（MANIFEST md5
+                             813f5d65…）。
   expert_tier.py             v1 swap-in 原型 —— 原样保留作失败基线（约 10 分钟流量后
                              输出腐坏）；expert_cold_pool.py 的 R1-R3 红线来源
   expert_cold_pool.py        第四轮动态专家冷池（见「第四轮」一节）：keep-mask +
                              pwal 后收缩 + 扁平 pin + 需求搬运 + v2.9 TopKConfig 身份门
 config/
-  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 第五轮定档（现役）：conc12 / 1M /
+  dealignai-qwen4exp-nvfp4kv.yaml   nvfp4 KV 方案 · 第五轮定档（容量兜底，停机待命）：conc12 / 1M /
                                     spec ON steps=2 / mamba64 + 每路径帽 16 /
                                     KV 池 2359296 / int8 ckpt ON（128 槽）/
                                     冷池 keep330+16 /
                                     decode CG bs[1,2,4,6,8,10,12] / prefill CG disabled
+                                    （同源补丁树 —— split-K 在其下次启动自动生效）
   expert_keep_330_final.json        每层 keep 集（48 × 330 全局专家 id），路由频率普查产物
                                     —— 冷池的武装输入
-  dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案 · 回滚栈（conc4 / 512K / MTP steps=2 / mamba48 + 每路径帽 16 / int8 ckpt ON / HiCache 关 / KV 池 1310720 / 专家冷池；2026-09-08 移植可移植项 + 第四轮 steps2 A/B + 第五轮 cached0 帽）
+  dealignai-qwen4exp-fp8kv.yaml     fp8 KV 方案 · 第六轮定档（现役）：conc8 / 1M（YaRN×4）/
+                                    MTP steps=2 / mamba48 + 每路径帽 16 / int8 ckpt ON（96 槽）/
+                                    HiCache 关 / KV 池 1651520 = (1M+2×256K)×1.05 / 专家冷池 /
+                                    decode CG bs[1,2,4,6,8]；unit 带 --enable-int8-mamba-checkpoint
+                                    --mamba-max-states-per-path 16；源码树加打 mqa_splitk.py
+                                    （09-08 移植可移植项 + 第四轮 steps2 A/B + 第五轮 cached0 帽 +
+                                    第六轮 1M/split-K）
   baseline/                         双方案调优前基准快照，作回滚锚点与前后对照证据：
                                     nvfp4kv —— mamba32 自动 sizing、KV 池 786432、无 FR-Spec 表、
                                              SAM 不设、extra_buffer。
@@ -183,6 +211,13 @@ scripts/
   warmup_qsa_nvfp4kv.py       在真实流量前进场加载，关掉 late-device-load OOM 窗口
                               （长 prefill、grammar bitmask、bs6 图桶）
   warmup_qsa_fp8kv.py         fp8 变体（含前缀缓存命中路径）
+  bench_qsa_mqa_split3.py     第六轮 split-K 饥饿实锤：生产晚期几何
+                              （rows=128 win=244K），56× 近线性加速
+  bench_qsa_configs.py        证伪存档：triton sparse-GQA 配置表扫描
+                              （全档 ±1% —— 不是杠杆，别再追）
+  bench_qsa_mqa_tiles.py      证伪存档：随机起点窗口微基准
+                              （病态 padding —— 形状教训的实物）
+  probe_qsa_saturation.py     证伪存档：形状中毒的饱和探针
 tests/
   test_cold_pool_logic.py    冷池 CPU 逻辑测试 T1–T9（收缩+搬运+remap+bias、打包
                               remap、需求暂存、弱需求拒绝、清单门、空闲行记账、bias
@@ -192,6 +227,19 @@ tests/
   probe_highwater_77.py      3×495K 高水位探针（冷灌 + A/B/C 重问）
   probe_g2x.py / probe_nvfp4_mamba_gate.py
                              mamba 槽 / 锚点门探针（G2X：3×233K 全命中）
+  probe_fp8kv_1m_bringup.py  第六轮开机验证：1M 冷灌 + 重问 + NIAH + 侧链
+  gateA_mqa_bitwise.py       第六轮逐比特门：split=64 vs split=1 logits，
+                             生产晚/中形状，锁 seed（需停服独占）
+  gateA2_mqa_bitwise_extended.py
+                             扩展逐比特格：9 形状类 ×（自对拍决定论 +
+                             跨 split + split32 交叉）
+  gateB_indexer_canary.py    indexer-topk 采集探针 —— 记录死路（capturer 在
+                             本架构自动禁用）；保留作负面结果 + meta_info 字段
+                             dump
+  gateD_quality_splitk.py    端到端：grammar / 中段分支 / 工具调用
+  （远端 /opt/sglang-test）   soak_splitk2.sh 新鲜文档静默腐化 soak（67 轮
+                             零违例）、battery.sh A/B QoS 套件、c8rep.sh
+                             temp-0 5 轮 burst 协议
 docs/
   RESULTS.md                  完整压测矩阵、MTP steps 1–3 校准表、mamba 槽经济学、
                               每一条死路和根因
@@ -218,6 +266,7 @@ bootstrap/
 9. **被 keep-mask 屏蔽的 router 喂不饱自己的需求信号。** 冷专家是 -inf 屏蔽，选择路径的需求恒为 0，池子永久饥饿（实测：30 分钟流量 staged=0）。需求必须从**屏蔽前**原始 logits 的 alpha 带探测。同类陷阱：暂存缓冲的切片若在回填前读取必须 `.clone()` —— 一个被 `fill_` 抹掉的视图曾静默杀死探针 v1 的强需求过滤。
 10. **投机解码草稿与 decoder 共享进程内 `layer_id` 号段。** NEXTN 草稿模型就是同一个类、`num_hidden_layers=1` → 它的第 0 层与 target 第 0 层撞车。任何只按 layer_id 门控的每层运行时机制（mask、remap、统计）都会静默劫持草稿 —— 要按武装时注册的 TopKConfig **对象身份**门控（v2.9；症状：草稿被 mask+remap 后 accept rate 0.21）。
 11. **`extra_buffer_lazy` + int8 mamba checkpoint 下，前缀复用的天花板是 checkpoint 池，不是 KV 树。** chunked prefill 每 4096 token 捐一份 int8 checkpoint；默认每路径帽 -1 时，单条 549K 链吃掉 ≈134 / 128 槽，两条链就互相驱逐成 `cached=0`（树和 KV 页都在，匹配已死）。`--mamba-max-states-per-path 16` 是零显存修复，两方案通吃；重问悬崖（89s → 0.9s）就是证据。上游 #22935 看着像但属不同病族（`no_buffer`）—— 别去追它的 split 墓碑修复。
+12. **1M 深度下冷 prefill 的瓶颈是 QSA indexer 的 CTA 几何，不是稀疏注意力 kernel。** 128MB logits 暂存预算把晚期行块钳到 128 行；`block_q=32` 时 tilelang MQA kernel 只开 4 个 CTA 对阵 148 个 SM（1.6 TF/s vs 并行化后 91 TF/s）—— 293s 冷灌里它占 ≈208s。键瓦片 split-K（grid.y=64、互斥列写入、mask kernel 不变）把 TTFT 砍半（→133s），且对 split=1 在 9 个生产形状类上逐比特相等。路上两个陷阱：微基准形状必须忠实于生产（因果掩码、连续起点、真实 launch 几何 —— 每项都能扭曲 4–30 倍，用账目算术当测谎仪）；任何在模型前向路径里 sync 的探针都会废掉 CUDA-graph capture 炸启动（`cudaErrorStreamCaptureInvalidated`）—— 必须用 `is_current_stream_capturing()` 守卫。
 
 ## 复现
 
@@ -230,13 +279,20 @@ export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
 
 # 1. 补丁（幂等；每次同步源码后重跑）
 python3 patches/apply_nvfp4_patches.py
-git -C /opt/sglang-src/sglang apply ../patches/0001-sampler-37962-tp1-sync-skip.diff
+# 0001/0002 是裸 diff 且路径前缀不一致 —— strip 级别随 cwd 变化，
+# 以下组合经 git apply --check 路径解析实测验证：
+git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0001-sampler-37962-tp1-sync-skip.diff   # 路径: python/sglang/…
+git -C /opt/sglang-src          apply -p1 /path/to/repo/patches/0002-mamba-ckpt-ple.diff               # 路径: sglang/python/sglang/…
+# （等价方案：在包根用 -p2 打 0002 —— bootstrap/MANIFEST.md 金标准演练即此法）
+python3 patches/mqa_splitk.py        # 第六轮：QSA indexer split-K（跑在 patcher 之后）
 
 # 2. 配置 —— YAML 放入 /opt/sglang-config，编辑 unit 里的 --model-path
 #    （现役 unit 硬编码 CT112 模型目录，YAML 里的 chat-template: 同理需改；
 #     仅 baseline unit 保留 ${MODEL_DIR} 占位符）
-systemctl start sglang-dealignai-qwen4exp-nvfp4kv
-systemctl enable --now sglang-dealignai-nvfp4kv-warmup   # one-shot，等 /health
+systemctl start sglang-dealignai-qwen4exp-fp8kv        # 第六轮现役方案
+systemctl enable --now sglang-dealignai-fp8kv-warmup   # one-shot，等 /health
+# 容量兜底（单卡互斥 —— 先停 fp8kv）：
+#   systemctl start sglang-dealignai-qwen4exp-nvfp4kv + 其 warmup unit
 
 # 3.（第四轮，可选）专家冷池 —— overlay 树 + 钩子 + keep 集 + env
 cp -a /opt/sglang-src /opt/sglang-patch            # fork 隔离，基线 commit 钉死
@@ -267,8 +323,8 @@ nvfp4 KV 路径完全由 `kv-cache-dtype: nvfp4` 门控 —— 换回 `fp8_e4m3`
 
 ## 约束与诚实声明
 
-- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第五轮定档现役：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / 每路径 ckpt 帽 16（int8 池 128 槽）/ KV 池 2,359,296 / decode CG bs[1,2,4,6,8,10,12]。** 热态：C1 ≈122–129 / C12 聚合 ≈704–710 / prefill ≈9.7K（冷前缀）——预热后验收 bench（steps=2/draft3），取代早先热缓存窗口的 146–171 / 773–825。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
-- 定档 fp8kv 栈（2026-09-11 升 1M）：可移植项已移植（见 §fp8kv 方案）、MTP steps=2（第四轮 A/B）、HiCache 关（int8 ckpt fail-fast）、conc4 / **YaRN×4 1M** / **KV 池 1,651,520 = (1×1M + 2×256K) × 1.05 防溢出余量**（池 ≈20.3 GB，扩后 fence ≈4.2 GB —— 与 nvfp4kv 的 5.29 同档冰面）/ mamba 48 + 帽 16 / 专家冷池。2×1M 双开已否决：需 25.77 GB，拆墙后 fence 剩 1.75 GB 属走钢丝。**上机门禁：YaRN×4 在 fp8 KV 下无 NIAH 背书——bring-up 必须先补验。**当前停止态（单卡互斥，nvfp4kv 现役）。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
+- 定档调优栈（第二轮，显存项已被第三轮取代）：GDN flashinfer 双端、mamba 钉 24、extra_buffer_lazy（别名参数走 CLI）、SAM=decode。第三轮现状：ctx 1M / YaRN ×4 显式 / spec OFF / KV 池 1,179,648 / int8 ckpt ON（补丁 0002 overlay）。**第五轮定档栈（第六轮起 nvfp4kv 转为兜底待机）：冷池 keep330+16 / spec ON steps=2 / conc 12 / mamba 64 / 每路径 ckpt 帽 16（int8 池 128 槽）/ KV 池 2,359,296 / decode CG bs[1,2,4,6,8,10,12]。** 热态：C1 ≈122–129 / C12 聚合 ≈704–710 / prefill ≈9.7K（冷前缀）——预热后验收 bench（steps=2/draft3），取代早先热缓存窗口的 146–171 / 773–825。回滚 = `switch_coldpool.sh off`，或用 `config/baseline/` 文件覆盖现役文件后重启 unit。
+- 定档 fp8kv 栈（第六轮，现役）：可移植项已移植（见 §fp8kv 方案）、MTP steps=2（第四轮 A/B）、HiCache 关（int8 ckpt fail-fast）、conc **8** / **YaRN×4 1M** / **KV 池 1,651,520 = (1×1M + 2×256K) × 1.05 防溢出余量**（池 ≈20.3 GB，**capture 后 fence 实测 4.00 GB** —— 回退触发线 <2.5 GB → 砍 decode CG 桶到 [1,2,4,6]）/ mamba 48 + 帽 16 / 专家冷池 / **QSA split-K**（1M 冷灌 TTFT 133s）。2×1M 双开已否决：需 25.77 GB，拆墙后 fence 剩 1.75 GB 属走钢丝。NIAH@1M 背书：**PASS**（第六轮开机验证，chat 端点 + `enable_thinking=false`）。当前现役；nvfp4kv 停机作 conc-12 兜底。回滚 = 用 `config/baseline/` 的 fp8kv 同名对覆盖现役文件。
 - 单卡消费级 GPU + 44 GB pinned PLE 表：nvfp4kv 与 fp8kv 两方案互斥；冷启动约 4-5 分钟（第四轮多 ~3.5 分钟权重加载 + 收缩）。unit 故意不 enable，避免开机抢 GPU。
 - 第四轮主机内存预算是刻意压到极限的：冷池 pinned 24.15 GB + PLE 表 pinned 64 GB（47.7 GB 被 2 的幂取整 —— `file` 后端 A/B 已调研、暂缓）压在 112 GB 机器上 → soak 末 MemAvailable ~20 GB。再要挂任何 pinned 消费者之前先看 `Shmem` 与 swap。
 - 冷池 + 投机的 C1（≈122–129）已逼近但略低于 fp8kv（≈165）—— 第三轮"fp4 KV 更慢"的差距主要是 spec-off 税，不全是 gather-dequant。上游原生 fp4 QSA 解码池（#37798）是追平或反超的路。
