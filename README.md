@@ -126,6 +126,18 @@ Honest caveats: the demand probe is torch-only (≈0.3 ms/layer/tick in eager �
 
 **Deployment note**: the A1 clamped `expert_cold_pool.py` was staged to CT112's overlay tree on 09-12 (md5 6d1769…, rollback `.bak-preclamp`); it takes effect on the next service restart — TP1 traffic is semantically identical either way (zero fused-shared ids today), so no urgency. The full R1–R4 + A/F report trail lives in `reviews/`.
 
+## Eighth round (2026-09-12): QSA top-k routed to flashinfer — long-context repetition collapse killed at the root
+
+**Symptom on the live box**: a long multi-turn session (~90K+ token accumulated context) degenerated into a `"hmmhmmhmm"`-style repetition loop, while short requests stayed clean. The same event left `Received output for rid='…' but the state was deleted in TokenizerManager` ×161 in journalctl — all lines inside a 2-second window, single rid: the client gave up on the looping generation, disconnected, and the scheduler's already-queued decode outputs arrived one tick late after the request state was popped. One causal chain (long row → repetition → disconnect → late-output flood), not two faults. Zombie classification rule of thumb: single rid, hundreds of lines inside seconds, no growth after = harmless late tail; chronic = one rid spreading over minutes.
+
+**Root cause** (sgl-project/sglang#36807, plus the comment thread): the QSA indexer's top-k selection — JIT `fast_topk<512>` (and its AOT twin `fast_topk_v2`) — stages threshold-bin candidates into a fixed 4096-entry shared-memory buffer. On concentrated score distributions at long row lengths (measured: L≈31K → ~16K candidates in one coarse fp16 bin; L≈66K → ~34K), the bin overflows and the excess candidates are silently dropped (`if (count_eq < kMaxNumTie)` first-arrival keep), no error raised, shapes look normal. Wrong top-k block set → attention focuses the wrong blocks → output degenerates into repetition. The failure is *deterministic on shape*: it's why only the longest-running sessions rot, and why restarting the service (fresh, shorter history) appears to fix it — it just moves the cliff.
+
+**Fix shipped here** (`patches/0003-qsa-topk-flashinfer-route.diff`, adapted from mochgolf's validated commit `a59543dee` on the upstream thread): reroute `qsa_fast_topk` through `sglang.kernels.ops.elementwise.fast_topk`, whose body now calls `flashinfer.top_k_ragged_transform(..., deterministic=True)` — capacity-safe (explicit overflow buffer in the cluster path), tie-deterministic, and CUDA-graph-capture-safe (verified by live traffic after restart: bs6 decode graphs + a real 67K-token request ran clean through the new path; also upstream-tested at 13-call × 20-replay capture). Working combo on Ada/turing-class SMs: default `tie_break=NONE, dsa_graph_safe=False` (the FilteredTopK specializations need 128 KiB dynamic shared memory → `cudaErrorNotSupported` below SM120). Upstream PRs #38144 / #37941 / #37893 fix the same mechanism in the kernels themselves (all still open); when any lands on `qwen4-main-squashed`, rebase the base tree and drop 0003 — the route is additive-neutral, keeping it is also fine.
+
+**Overlay-tree gotcha**: this repo's services run from `PYTHONPATH=/opt/sglang-patch/…` — the source-tree patch does NOT reach the running process unless the overlay tree gets the same files copied. `diff -q` the both trees after syncing (pattern already in §Seventh-round deploy note for expert_cold_pool.py). Verified live: patcher output + `inspect.getsource` from the service interpreter.
+
+**Rollback**: the diff is self-contained (2 files); `.bak-20260912` anchors sit next to both files on CT112. Without the fix the box still serves — the collapse only bites >~30K-token rows with concentrated scores; it's a quality cliff, not availability.
+
 ## The fp8kv scheme (round-6 validated stack — currently stopped, single-stream fallback)
 
 fp8kv is not the untouched old config — on 2026-09-08 it absorbed the portable half of the nvfp4kv tuning, on 09-11 it took the round-5 cap16 + cold pool, and that same day it was promoted to the live scheme with 1M context and the round-6 QSA split-K (§Sixth round). The two schemes swap on one GPU (single-card mutex); as of round 7 nvfp4kv is LIVE and fp8kv is the stopped fallback.
@@ -166,6 +178,11 @@ patches/
   0002-mamba-ckpt-ple.diff   int8 mamba checkpoint pool mirrors PLE side states
                              (short-conv bf16 / ngram int64 rows) instead of the
                              upstream ValueError guard. Upstream PR #38619.
+  0003-qsa-topk-flashinfer-route.diff
+                             round-8: route QSA top-k to flashinfer's
+                             capacity-safe `top_k_ragged_transform` (kills the
+                             silent-overflow repetition collapse; see §Eighth
+                             round). Apply to BOTH trees (src + overlay).
   mqa_splitk.py              round-6 idempotent patcher: QSA prefill-MQA split-K
                              (grid.y=64 disjoint key-tile ranges; kills the 4-CTA
                              late-chunk starvation, 1M cold TTFT -54.5%). Apply
@@ -328,6 +345,10 @@ git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0001-sampler-37962
 git -C /opt/sglang-src          apply -p1 /path/to/repo/patches/0002-mamba-ckpt-ple.diff               # paths: sglang/python/sglang/…
 # (equivalently from the package root: 0002 with -p2 — what bootstrap/MANIFEST.md gold-standard used)
 python3 patches/mqa_splitk.py        # round 6: QSA indexer split-K (after the patcher)
+# round 8: QSA top-k route fix — paths python/sglang/…, apply inside the repo dir,
+# BEFORE `cp -a src patch` so the overlay inherits it (if the overlay already
+# exists: copy both files into it and diff-verify both trees):
+git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0003-qsa-topk-flashinfer-route.diff
 
 # 2. config — drop YAMLs in /opt/sglang-config, edit --model-path in the unit
 #    (hardcoded to the CT112 model dir; chat-template: in the YAMLs likewise)

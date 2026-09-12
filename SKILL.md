@@ -31,7 +31,9 @@ Each scheme ships tuned-plus-baseline: active files in `config/`, pre-tuning sna
    export SGLANG_SRT=/opt/sglang-src/sglang/python/sglang/srt
    /opt/sglang-env/bin/python patches/apply_nvfp4_patches.py   # ALL-PATCHED + py_compile each
    git -C /opt/sglang-src/sglang apply /path/patches/0001-sampler-37962-tp1-sync-skip.diff
+   git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0003-qsa-topk-flashinfer-route.diff
    ```
+   0003 routes the QSA top-k through flashinfer's capacity-safe `top_k_ragged_transform` (round 8 — kills the silent-overflow repetition collapse on >~30K-token rows; see README §Eighth round). Paths are `python/sglang/…`, apply inside the repo dir; apply BEFORE the overlay copy in step 2 so the overlay inherits it. If an overlay already exists when patching, copy both touched files into it and `diff -q` both trees.
    Re-run after any source sync. The patcher checks anchor counts.
 2. **Overlay tree (rounds 3–5).** `cp -a /opt/sglang-src /opt/sglang-patch` (fork isolation), then inside the patch tree:
    ```bash
@@ -86,7 +88,7 @@ fp8kv frozen state (in-repo YAML+unit): conc4 / YaRN×2 512K / **steps=2** (roun
 
 ## Full restore on a fresh same-hardware box
 
-`bootstrap/MANIFEST.md` is the authoritative checklist: base tarball + sha256, pip lock, ninja shim, chat template, per-file md5 table for the 7-file overlay delta (models/qwen4_exp.py, qwen4_exp_ple_table.py, model_executor/model_runner.py, layers/moe/topk.py, layers/moe/expert_cold_pool.py, mem_cache/mamba_checkpoint_pool.py, mem_cache/memory_pool.py — `runtime-src/` holds the exact live bytes; the diff-vs-clean-tree list there is complete and verified 2026-09-11). Order: env lock → base tarball build + patcher/0001 → overlay + 0002 → cold-pool deploy → configs/units/shim/template → start → verify step 6. The repo is the backup: frozen remote state == git HEAD ≥ `df987bc` (live YAMLs md5-verified against repo same day; intermediate `.bak-*` on the box deleted 2026-09-11, rollup tarball `CT112:/root/backups/sglang-frozen-round5-20260911.tar.gz` sha256 `80d88f36…` in MANIFEST).
+`bootstrap/MANIFEST.md` is the authoritative checklist: base tarball + sha256, pip lock, ninja shim, chat template, per-file md5 table for the overlay delta (models/qwen4_exp.py, qwen4_exp_ple_table.py, model_executor/model_runner.py, layers/moe/topk.py, layers/moe/expert_cold_pool.py, mem_cache/mamba_checkpoint_pool.py, mem_cache/memory_pool.py + round-8's layers/attention/qsa/kernel.py and kernels/ops/elementwise/fast_topk.py — `runtime-src/` holds the exact live bytes; the diff-vs-clean-tree list there is complete and verified 2026-09-12). Order: env lock → base tarball build + patcher/0001/0003 → overlay + 0002 → cold-pool deploy → configs/units/shim/template → start → verify step 6. The repo is the backup: frozen remote state == git HEAD ≥ `df987bc` (live YAMLs md5-verified against repo same day; intermediate `.bak-*` on the box deleted 2026-09-11, rollup tarball `CT112:/root/backups/sglang-frozen-round5-20260911.tar.gz` sha256 `80d88f36…` in MANIFEST).
 
 ## Pitfalls checklist
 

@@ -1,0 +1,124 @@
+diff --git a/python/sglang/srt/layers/attention/qsa/kernel.py.bak-20260912 b/python/sglang/srt/layers/attention/qsa/kernel.py
+index 1d8e9ec..c873496 100644
+--- a/python/sglang/srt/layers/attention/qsa/kernel.py.bak-20260912
++++ b/python/sglang/srt/layers/attention/qsa/kernel.py
+@@ -26,34 +26,14 @@ def qsa_fast_topk(
+     row_ends: torch.Tensor,
+     topk: int,
+ ) -> torch.Tensor:
+-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
++    """Select compressed blocks with the capacity-safe ragged top-k path."""
+ 
+     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
+     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+     if logits.is_cuda:
+-        if topk == 512:
+-            # Prefer the JIT kernel: it ships with the sglang python package,
+-            # so top-k 512 works regardless of the installed sgl_kernel version.
+-            from sglang.kernels.ops.elementwise.fast_topk import fast_topk
++        from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+ 
+-            return fast_topk(logits, lengths, topk=512, row_starts=starts)
+-
+-        from sgl_kernel import top_k as top_k_module
+-
+-        supported_topk = getattr(top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,))
+-        if topk in supported_topk:
+-            return top_k_module.fast_topk_v2(
+-                logits, lengths, topk=topk, row_starts=starts
+-            )
+-        if topk != 512 or 2048 not in supported_topk:
+-            raise ValueError(
+-                f"QSA top-k {topk} is unsupported by sgl_kernel; "
+-                f"supported values are {supported_topk}"
+-            )
+-        candidates = top_k_module.fast_topk_v2(
+-            logits, lengths, topk=2048, row_starts=starts
+-        )
+-        return _rerank_qsa_topk_candidates(logits, candidates, starts, topk)
++        return fast_topk(logits, lengths, topk=topk, row_starts=starts)
+ 
+     # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
+     output = torch.full(
+diff --git a/python/sglang/kernels/ops/elementwise/fast_topk.py.bak-20260912 b/python/sglang/kernels/ops/elementwise/fast_topk.py
+index 7e8757f..8922818 100644
+--- a/python/sglang/kernels/ops/elementwise/fast_topk.py.bak-20260912
++++ b/python/sglang/kernels/ops/elementwise/fast_topk.py
+@@ -1,38 +1,17 @@
+ from __future__ import annotations
+ 
+-from typing import TYPE_CHECKING, Optional
++from typing import Optional
+ 
+ import torch
+ 
+-from sglang.kernels.jit.utils import (
+-    cache_once,
+-    is_arch_support_pdl,
+-    load_jit,
+-    make_cpp_args,
+-)
+-
+-if TYPE_CHECKING:
+-    from tvm_ffi.module import Module
+-
+ _FAST_TOPK_SUPPORTED_K = (512, 2048)
+ 
+ 
+-@cache_once
+-def _jit_fast_topk_module(topk: int) -> Module:
+-    """Compile and cache the JIT fast top-k module for a given k."""
+-    # Checks on the compile key live here, not in `fast_topk`: `cache_once`
+-    # keys on `topk`, so this runs once per specialisation.
++def _check_topk(topk: int) -> None:
+     if topk not in _FAST_TOPK_SUPPORTED_K:
+         raise RuntimeError(
+             f"Unsupported topk {topk}. Supported: {_FAST_TOPK_SUPPORTED_K}"
+         )
+-    args = make_cpp_args(topk, is_arch_support_pdl())
+-    return load_jit(
+-        "fast_topk",
+-        *args,
+-        cuda_files=["elementwise/fast_topk.cuh"],
+-        cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
+-    )
+ 
+ 
+ def fast_topk(
+@@ -47,7 +26,7 @@ def fast_topk(
+     Row b selects the `topk` largest values in
+     ``score[b, row_starts[b] : row_starts[b] + lengths[b]]`` and returns their
+     indices relative to ``row_starts[b]``. Slots beyond ``lengths[b]`` are -1.
+-    Output order within a row is unspecified (atomic collection order).
++    Output order is deterministic for fixed inputs but otherwise unspecified.
+ 
+     Parameters
+     ----------
+@@ -60,11 +39,20 @@ def fast_topk(
+     -------
+     CUDA int32 tensor [B, topk]
+     """
++    _check_topk(topk)
+     batch = score.shape[0]
+-    if row_starts is None:
+-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
+-    indices = score.new_empty((batch, topk), dtype=torch.int32)
+-
+-    module = _jit_fast_topk_module(topk)
+-    module.fast_topk(score, row_starts, indices, lengths)
+-    return indices
++    offsets = torch.zeros(batch, dtype=torch.int32, device=score.device)
++    starts = None
++    if row_starts is not None:
++        starts = row_starts.to(device=score.device, dtype=torch.int32).contiguous()
++
++    from flashinfer import top_k_ragged_transform
++
++    return top_k_ragged_transform(
++        score.contiguous(),
++        offsets,
++        lengths.to(device=score.device, dtype=torch.int32).contiguous(),
++        topk,
++        deterministic=True,
++        row_starts=starts,
++    )

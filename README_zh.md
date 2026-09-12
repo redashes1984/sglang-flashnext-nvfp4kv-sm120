@@ -126,6 +126,18 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 **部署说明**：A1 的钳制版 `expert_cold_pool.py` 已于 09-12 落到 CT112 的 overlay 树（md5 6d1769…，回滚 `.bak-preclamp`），下次服务重启时生效 —— TP1 下语义等价（当前融合共享数为 0），不紧急。R1–R4 + A/F 全量报告链在 `reviews/`。
 
+## 第八轮（2026-09-12）：QSA top-k 改路由到 flashinfer —— 根治长上下文复读崩溃
+
+**现场症状**：一个累计 ~90K+ token 的长多轮会话退化为 `"hmmhmmhmm"` 式复读循环，短请求始终正常。同一事件在 journalctl 留下 ×161 条 `Received output for rid='…' but the state was deleted in TokenizerManager` —— 全部挤在 2 秒窗口内、单一 rid：客户端对复读输出失去耐心断开连接，scheduler 已排队的 decode 输出在请求状态被弹出后一拍迟到。这是一条因果链（长行 → 复读 → 断连 → 迟到回包刷屏），不是两个故障。僵尸请求判据速查：单 rid、数百行挤在同几秒、之后不再增长 = 无害迟到尾巴；慢性病的特征是同一 rid 跨分钟级持续刷屏。
+
+**根因**（sgl-project/sglang#36807 及评论区）：QSA indexer 的 top-k 选择 —— JIT `fast_topk<512>`（及其 AOT 孪生 `fast_topk_v2`）—— 把阈值桶候选装进固定 4096 项共享内存缓冲。长行 + 集中分数分布下（实测：L≈31K → 单个粗粒度 fp16 桶 ~16K 候选；L≈66K → ~34K），桶溢出，多余候选被静默丢弃（`if (count_eq < kMaxNumTie)` 先到先得），不报错、形状正常。top-k 块集合选错 → 注意力聚焦错块 → 输出退化为复读。该故障**对形态确定**：这解释了为什么只有最长的会话会腐坏、为什么重启服务（历史变短）看似治好 —— 它只是挪动了悬崖。
+
+**本仓库的修复**（`patches/0003-qsa-topk-flashinfer-route.diff`，改编自上游评论区 mochgolf 的已验证 commit `a59543dee`）：`qsa_fast_topk` 改走 `sglang.kernels.ops.elementwise.fast_topk`，其函数体调用 `flashinfer.top_k_ragged_transform(..., deterministic=True)` —— 容量安全（cluster 路径带显式溢出缓冲）、tie 确定、CUDA Graph capture 安全（重启后真实流量验证：bs6 decode 图 + 一笔真实 67K-token 请求干净走过新路径；上游另有 13 连调 × 20 重放的 capture 测试）。Ada/Turing 档 SM 的可用组合：默认 `tie_break=NONE, dsa_graph_safe=False`（FilteredTopK 特化要 128 KiB 动态共享内存，SM120 以下 `cudaErrorNotSupported`）。上游 #38144 / #37941 / #37893 从内核本体修同一机制（截至本条均 OPEN）；任一合入 `qwen4-main-squashed` 后 rebase 基底、摘掉 0003 即可 —— 该路由属叠加中性，留着也无害。
+
+**Overlay 树坑**：本仓库服务跑在 `PYTHONPATH=/opt/sglang-patch/…` —— 只打源码树不改 overlay 树的话，运行进程根本看不到补丁。同步后要 `diff -q` 两棵树（与第七轮 expert_cold_pool.py 的部署注记同款）。实测核验方式：apply 输出 + 用服务解释器 `inspect.getsource` 确认。
+
+**回滚**：diff 自包含（2 文件）；CT112 上两文件旁有 `.bak-20260912` 锚点。不打补丁机器照常服务 —— 复读崩溃只在 >~30K token 长行 + 集中分数时发作；属质量悬崖，不是可用性问题。
+
 ## fp8kv 方案（第六轮验证栈 · 现停机，单流兜底）
 
 fp8kv 不是原始旧配置 —— 2026-09-08 吸收 nvfp4kv 可移植的一半调优，09-11 吃进第五轮 cap16 + 冷池，同日升为现役并带上 1M 上下文与第六轮 QSA split-K（见第六轮）。两方案同卡互换（单卡互斥）；第七轮起 nvfp4kv 回归现役，fp8kv 停机作兜底。
@@ -166,6 +178,10 @@ patches/
   0002-mamba-ckpt-ple.diff   int8 mamba checkpoint 池镜像 PLE side states
                              （short-conv bf16 / ngram int64 行），取代上游的
                              ValueError 守卫。对应上游 PR #38619。
+  0003-qsa-topk-flashinfer-route.diff
+                             第八轮：QSA top-k 改路由到 flashinfer 容量安全的
+                             `top_k_ragged_transform`（根治长上下文复读崩溃，见
+                             「第八轮」一节）。src 与 overlay 两棵树都要打。
   mqa_splitk.py              第六轮幂等 patcher：QSA prefill-MQA split-K
                              （grid.y=64 键瓦片均分互斥列区间；杀掉晚期 4-CTA
                              饥饿，1M 冷灌 TTFT -54.5%）。跑在 apply_nvfp4_patches
@@ -313,6 +329,9 @@ git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0001-sampler-37962
 git -C /opt/sglang-src          apply -p1 /path/to/repo/patches/0002-mamba-ckpt-ple.diff               # 路径: sglang/python/sglang/…
 # （等价方案：在包根用 -p2 打 0002 —— bootstrap/MANIFEST.md 金标准演练即此法）
 python3 patches/mqa_splitk.py        # 第六轮：QSA indexer split-K（跑在 patcher 之后）
+# 第八轮：QSA top-k 路由修复 —— 路径 python/sglang/…，在仓库目录内 apply，
+# 且要在 `cp -a src patch` 之前打（overlay 若已存在：两个文件同步拷入并 diff 校验两树）：
+git -C /opt/sglang-src/sglang apply -p1 /path/to/repo/patches/0003-qsa-topk-flashinfer-route.diff
 
 # 2. 配置 —— YAML 放入 /opt/sglang-config，编辑 unit 里的 --model-path
 #    （现役 unit 硬编码 CT112 模型目录，YAML 里的 chat-template: 同理需改；

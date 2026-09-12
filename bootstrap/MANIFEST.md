@@ -42,8 +42,12 @@ alone. Verify each hash before trusting a restored file.
 
 Build `/opt/sglang-patch` = `cp -a /opt/sglang-src` (the patched base tree), then
 these exact files must match the hashes; anything else in the tree is a lie.
+Round-8 note: after `cp -a`, the TWO files of patch 0003 must be present in the
+overlay too (they live outside `srt/` — paths below); if the overlay predates the
+patch, copy both files in and `diff -q` both trees — PYTHONPATH makes the overlay
+the only tree the service reads.
 
-| File (under `sglang/python/sglang/srt/`) | md5 (live + repo `runtime-src/`) | Produced by |
+| File (under `sglang/python/sglang/srt/` unless noted) | md5 (live + repo `runtime-src/`) | Produced by |
 |---|---|---|
 | `layers/moe/topk.py` | `d150f8fde0a68d681d70c341ba201603` | deploy_expert_cold_pool.py (5 anchors) |
 | `layers/moe/expert_cold_pool.py` | `6d17690934bfcfb1587f2db88b52141f` | copy patches/expert_cold_pool.py (round-7: remap fused-shared clamp, audit R1-🟡1 fix; staged on CT112 09-12, takes effect on next restart — pre-clamp rollback anchor `.bak-preclamp` md5 `e891bd62aa6261e1e3be6a588d008fc7`) |
@@ -51,6 +55,8 @@ these exact files must match the hashes; anything else in the tree is a lie.
 | `models/qwen4_exp.py` | `8aada4a8416447a87ad8781e2a9f27fb` | (runtime-src snapshot) |
 | `models/qwen4_exp_ple_table.py` | `b788ee8fcb2969bb525cb0617c1d801f` | (runtime-src snapshot) |
 | `layers/attention/qsa/mqa.py` | `d04fb0a5a90a06579b159cfde4411d68` | patches/mqa_splitk.py (run AFTER qsa patcher; idempotent marker `split: int = 1`; rollback anchor `mqa.py.bak-mqasplit` md5 `813f5d65…` = pristine 78c5024e9) |
+| `layers/attention/qsa/kernel.py` | `8ba10cbcf5f7511681de25fbdd73957b` | patches/0003 round-8 route fix (marker `capacity-safe ragged top-k`; also lives outside srt — see next row) |
+| `../../kernels/ops/elementwise/fast_topk.py` (under `sglang/python/sglang/`, NOT under srt) | `d1bc8ef344bf73d29b20898fe3712d71` | patches/0003 round-8 (`flashinfer.top_k_ragged_transform` body; marker `top_k_ragged_transform`) |
 | `mem_cache/mamba_checkpoint_pool.py` | `ccc608bb3faa7ac9dc253380af32db52` | patch 0002 |
 | `mem_cache/memory_pool.py` | `90b27aad2ed8e2829a95ce968cfb47eb` | patcher + patch 0002 |
 
