@@ -134,6 +134,8 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 
 **本仓库的修复**（`patches/0003-qsa-topk-flashinfer-route.diff`，改编自上游评论区 mochgolf 的已验证 commit `a59543dee`）：`qsa_fast_topk` 改走 `sglang.kernels.ops.elementwise.fast_topk`，其函数体调用 `flashinfer.top_k_ragged_transform(..., deterministic=True)` —— 容量安全（cluster 路径带显式溢出缓冲）、tie 确定、CUDA Graph capture 安全（重启后真实流量验证：bs6 decode 图 + 一笔真实 67K-token 请求干净走过新路径；上游另有 13 连调 × 20 重放的 capture 测试）。Ada/Turing 档 SM 的可用组合：默认 `tie_break=NONE, dsa_graph_safe=False`（FilteredTopK 特化要 128 KiB 动态共享内存，SM120 以下 `cudaErrorNotSupported`）。上游 #38144 / #37941 / #37893 从内核本体修同一机制（截至本条均 OPEN）；任一合入 `qwen4-main-squashed` 后 rebase 基底、摘掉 0003 即可 —— 该路由属叠加中性，留着也无害。
 
+**中期（1-2 周）：盯 #38144。** 它的价值是"修在原始 kernel 内部 + 带回归测试"，对整个库更彻底；对我们而言只是让 fork 基底更干净。合入后直接 rebase 基底，路由分支留着无害（自动退化为冗余 fallback）。同期还有 #37893/#37941 三个 PR 在竞争同一修复位，上游收敛选哪个之前不用动。
+
 **Overlay 树坑**：本仓库服务跑在 `PYTHONPATH=/opt/sglang-patch/…` —— 只打源码树不改 overlay 树的话，运行进程根本看不到补丁。同步后要 `diff -q` 两棵树（与第七轮 expert_cold_pool.py 的部署注记同款）。实测核验方式：apply 输出 + 用服务解释器 `inspect.getsource` 确认。
 
 **回滚**：diff 自包含（2 文件）；CT112 上两文件旁有 `.bak-20260912` 锚点。不打补丁机器照常服务 —— 复读崩溃只在 >~30K token 长行 + 集中分数时发作；属质量悬崖，不是可用性问题。
