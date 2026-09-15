@@ -1,0 +1,43 @@
+--- kv_cache_configurator.py.bak-estfix-20260915	2026-09-12 18:41:01.476639191 +0000
++++ kv_cache_configurator.py	2026-09-15 08:12:43.496531097 +0000
+@@ -2430,6 +2430,13 @@
+         else:
+             replayssm_fixed_bytes = 0
+             replayssm_ring_per_slot = replayssm_ring_per_req
++        # estfix (2026-09-15, from jpezzulli/pennyroyal estfix lineage): under
++        # gdn_mtp_cache_mode="none" memory_pool never allocates intermediate_ssm
++        # (SpeculativeState.intermediate_ssm=None, same guard in memory_pool.py
++        # ~L761), so the per-draft intermediate must NOT be charged against the
++        # KV pool budget. Allocation side is the single source of truth; the conv
++        # window scratch (stays allocated in none mode) rides runtime slack.
++        gdn_none_active = get_exec().mamba.gdn_mtp_cache_mode == "none"
+         if has_spec_dec:
+             assert get_spec().speculative_num_draft_tokens is not None
+             assert get_schedule().max_running_requests is not None
+@@ -2444,7 +2451,7 @@
+             # Reserve intermediate memory based on capped max_num_reqs (+1: the
+             # pool's padding slot, see memory_pool.py). Skipped under replayssm
+             # (no intermediate_ssm allocated).
+-            if has_spec_dec and not replayssm_active:
++            if has_spec_dec and not replayssm_active and not gdn_none_active:
+                 ratio = self._calculate_mamba_ratio()
+                 capped_reqs = min(
+                     get_schedule().max_running_requests // self.ps.attn_dp_size,
+@@ -2468,7 +2475,7 @@
+             )
+             # Reserve intermediate memory based on capped max_num_reqs (+1: the
+             # pool's padding slot). Skipped under replayssm.
+-            if has_spec_dec and not replayssm_active:
++            if has_spec_dec and not replayssm_active and not gdn_none_active:
+                 intermediate_size = (
+                     stage_per_req
+                     * (get_schedule().max_mamba_cache_size + 1)
+@@ -2490,7 +2497,7 @@
+             )
+             mamba_budget_bytes = mamba_budget * (1 << 30)
+ 
+-            if has_spec_dec and not replayssm_active:
++            if has_spec_dec and not replayssm_active and not gdn_none_active:
+                 ratio = self._calculate_mamba_ratio()
+                 D = get_spec().speculative_num_draft_tokens
+                 # Joint solve: main_state + intermediate = mamba_budget

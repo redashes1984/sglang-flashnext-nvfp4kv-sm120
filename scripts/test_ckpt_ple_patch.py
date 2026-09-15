@@ -109,6 +109,13 @@ fake_exec = SimpleNamespace(mamba=SimpleNamespace(
 import sglang.srt.runtime_context as rc
 _orig_get_exec = rc.get_exec
 rc.get_exec = lambda: fake_exec
+# rebase drift fix (2026-09-15): mamba_checkpoint_pool binds `get_exec` via
+# `from ... import get_exec` at module level, so patching rc alone silently
+# misses — the factory sees the real (contextless) get_exec and returns None.
+# Patch the name bound IN THE CONSUMING MODULE too (harmless on older trees
+# where the attribute path was the only one).
+_mcp_orig_get_exec = mcp.get_exec
+mcp.get_exec = rc.get_exec
 try:
     p6 = mcp.maybe_init_int8_mamba_checkpoint_pool(
         mamba_size=6, cache_params=fake_params,
@@ -121,5 +128,6 @@ except TypeError as e:
     check(f"T6 factory path TypeError: {e}", False)
 finally:
     rc.get_exec = _orig_get_exec
+    mcp.get_exec = _mcp_orig_get_exec
 
 print("\nFAILURES:", fails if fails else "none")
