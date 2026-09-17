@@ -1,0 +1,62 @@
+[Unit]
+Description=SGLang dealignai Qwen3.8-Flash-Next fp8kv+HiCache (pennyroyal-v2.5.0, port 8000)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/pennyroyal
+ExecStartPre=/usr/bin/mkdir -p /opt/pennyroyal-cache/huggingface /opt/pennyroyal-cache/torch /opt/pennyroyal-cache/torchinductor /opt/pennyroyal-cache/triton /opt/pennyroyal-cache/cuda /opt/pennyroyal-cache/flashinfer /opt/pennyroyal-cache/sglang/jit
+ExecStart=/opt/pennyroyal/.venv/bin/sglang serve \
+  --model-path /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
+  --config /opt/sglang-config/dealignai-fp8kv-hicache.yaml \
+  --ple-offload-embedding \
+  --warmups=structured_output
+# --- 干净环境：无 PYTHONPATH overlay、无旧代 env hacks ---
+Environment=PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=CUDA_HOME=/usr/local/cuda
+Environment=CUDACXX=/usr/local/cuda/bin/nvcc
+Environment=CC=/usr/bin/gcc-14
+Environment=CXX=/usr/bin/g++-14
+Environment=CUDAHOSTCXX=/usr/bin/g++-14
+Environment=TORCH_CUDA_ARCH_LIST=12.0
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/lib64
+Environment=CUDA_DEVICE_ORDER=PCI_BUS_ID
+Environment=CUDA_VISIBLE_DEVICES=0
+# --- 缓存落本 CT 根盘 (存储分层红线 2026-09-16: CT 独有内容不落数据盘) ---
+Environment=HF_HOME=/opt/pennyroyal-cache/huggingface
+Environment=XDG_CACHE_HOME=/opt/pennyroyal-cache
+Environment=TORCH_HOME=/opt/pennyroyal-cache/torch
+Environment=TORCHINDUCTOR_CACHE_DIR=/opt/pennyroyal-cache/torchinductor
+Environment=TRITON_CACHE_DIR=/opt/pennyroyal-cache/triton
+Environment=CUDA_CACHE_PATH=/opt/pennyroyal-cache/cuda
+Environment=FLASHINFER_WORKSPACE_BASE=/opt/pennyroyal-cache/flashinfer
+Environment=SGLANG_CACHE_DIR=/opt/pennyroyal-cache/sglang
+Environment=SGLANG_JIT_CACHE_DIR=/opt/pennyroyal-cache/sglang/jit
+# --- 运行时调优 (launcher 同款) ---
+Environment=SGLANG_MAMBA_CONV_DTYPE=bfloat16
+Environment=SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+Environment=NUMPY_MADVISE_HUGEPAGE=0
+Environment=SGLANG_MM_PREPROCESS_DEVICE=cpu
+Environment=SGLANG_SM120_ONLINE_MXFP8=true
+Environment=OMP_NUM_THREADS=4
+Environment=MKL_NUM_THREADS=4
+Environment=TOKENIZERS_PARALLELISM=false
+Environment=PYTHONUNBUFFERED=1
+# --- JIT 编译串行 (AntigravityAI 实证: PLE 钉载后 host 内存紧张, 多线程 nvcc 编译风暴 = 全节点僵死) ---
+Environment=SGLANG_NEXTN_EARLY_SHARE=1
+Environment=MAX_JOBS=1
+Environment=FLASHINFER_NINJA_JOBS=1
+Environment=TORCHINDUCTOR_COMPILE_THREADS=1
+Environment=SGLANG_EXPERT_KEEP_MASK=/opt/sglang-config/expert_keep_330_final.json
+Environment=SGLANG_EXPERT_KEEP_OFFLOAD=1
+Environment=SGLANG_EXPERT_COLD_POOL_SLOTS=64
+Environment=SGLANG_COLD_DEBUG=1
+LimitNOFILE=65536
+LimitNPROC=4096
+Restart=no
+StandardOutput=journal
+StandardError=journal
+
+
+[Install]
+WantedBy=multi-user.target

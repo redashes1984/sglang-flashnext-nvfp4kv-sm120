@@ -1,0 +1,90 @@
+# SGLang dealignai Qwen3.8-Flash-Next — fp8kv + HiCache 方案 (pennyroyal-v2.5.0)
+# 配方来源: jpezzulli serve-flash-next.sh (qualified) × AntigravityAI 终态 §10 (62G 战场修正)
+# 权重: dealignai ABLITERATED NVFP4 (plain: attn/GDN/lm_head BF16, 比 mixed 战场重 ~2.5G)
+#   → cap 不照抄 1,111,168; 首启 auto 观测后钉 (预测先行的边界模型方法论)
+#   port 8000；served-model-name Qwen3.8-Flash-Next-NVFP4（Hindsight 路由键，禁改）
+#   PLE: fp8 47.68G 常驻内存 (--ple-offload-embedding, PENNY_PLE_BACKEND=ram 默认)
+#   HiCache ON 13G (AntigravityAI 上限; 32G 会在 PLE 钉载后挤爆内存账)
+#   ⚠️ fp8 KV 才配 HiCache: #36121 (nvfp4 KV 驱逐回载静默腐坏) — 本方案 kv=fp8_e4m3 无此约束
+#   MTP ON: NEXTN steps3/topk1/draft4, 5 mamba 槽/路 → mamba 20 = 4 路 (AntigravityAI 终态)
+#   expandable_segments 不设 (AntigravityAI: 极限 fraction 下偷 ~7% 池, 必删)
+# --- Network ---
+host: 0.0.0.0
+port: 8000
+
+# --- Device & Parallelism ---
+device: cuda
+tensor-parallel-size: 1
+dtype: bfloat16
+kv-cache-dtype: fp8_e4m3
+
+# --- Quantization (checkpoint config 自动识别 modelopt_fp4; launcher 同款显式) ---
+quantization: modelopt_fp4
+
+# --- Memory ---
+mem-fraction-static: 0.98                    # AntigravityAI 边界模型: fraction 退化为护栏, 锁存在时 0.96-0.99 等价
+max-total-tokens: 1572864                # pinned 2026-09-16: 64x5759, conc12 auto 实测值; 摘cap=回退勿摘
+context-length: 1048576                      # YaRN x4; override in json-model-override-args
+max-running-requests: 8                     # mamba 60 / 5槽 = 12 路 (2026-09-16 棣民令)
+max-prefill-tokens: 16384
+chunked-prefill-size: 4096                   # 8192 与极限 fraction 组合 OOM (AntigravityAI 发现⑥)
+
+# --- Attention Backends (SM120) ---
+# decode-attention-backend: auto (qualified 形态不显式钉; 我们的 nvfp4kv 旧账 trtllm_mha 是 fp4-KV 时代产物)
+linear-attn-decode-backend: flashinfer
+linear-attn-prefill-backend: flashinfer      # GDN 双端显式 (SM120 auto-resolve 会回落 triton)
+
+# --- Scheduler (QSA hybrid) ---
+schedule-policy: lpm
+max-mamba-cache-size: 40                  # 12 路 x 5 槽 (MTP draft4+1)
+gdn-mtp-cache-mode: none                     # MTP ON 但 none-mode (他们的终态组合)
+
+# --- Mamba / GDN ---
+mamba-ssm-dtype: bfloat16
+mamba-track-interval: 64
+
+# --- Speculative decoding NEXTN (MTP 回归) ---
+speculative-algorithm: NEXTN
+speculative-num-steps: 2
+speculative-eagle-topk: 1
+speculative-num-draft-tokens: 4
+speculative-draft-model-quantization: unquant
+# speculative-attention-mode: 不设 (AntigravityAI 终态无此行)
+
+# --- RoPE YaRN x4 (1M) ---
+json-model-override-args:
+  text_config:
+    rope_parameters:
+      mrope_interleaved: true
+      mrope_section: [11, 11, 10]
+      rope_type: yarn
+      rope_theta: 10000000
+      partial_rotary_factor: 0.25
+      factor: 4.0
+      original_max_position_embeddings: 262144
+
+# --- HiCache (fp8 KV 配套) ---
+enable-hierarchical-cache: true
+hicache-size: 13                             # GB; AntigravityAI 62G 实测上限, 我们 PLE 更大 (47.7G vs 28G) 不加码
+hicache-host-memory-mode: cache
+hicache-write-policy: write_through          # write_back 重启后命中率归零 (他们的坑)
+hicache-io-backend: kernel
+hicache-mem-layout: page_first
+hicache-storage-prefetch-policy: timeout
+
+# --- Streaming ---
+stream-interval: 1
+watchdog-timeout: 1800
+
+# --- Chat Template (froggeric v22.5, 与 pennyroyal 钉定版同 sha) ---
+chat-template: /mnt/GLOWAY_YCT2TNVMe_202732/models/sglang_models/dealignai_Qwen3.8-Flash-Next-ABLITERATED-NVFP4/chat_template_froggeric_v22.5.jinja
+
+# --- Parsers ---
+reasoning-parser: qwen3
+tool-call-parser: qwen3_coder
+
+# --- Misc ---
+sleep-on-idle: true
+served-model-name: Qwen3.8-Flash-Next-NVFP4
+enable-metrics: true
+enable-cache-report: true

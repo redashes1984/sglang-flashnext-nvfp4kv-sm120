@@ -1,0 +1,456 @@
+diff --git a/python/sglang/kernels/ops/elementwise/fast_topk.py b/python/sglang/kernels/ops/elementwise/fast_topk.py
+index 7e8757fc7..89228184e 100644
+--- a/python/sglang/kernels/ops/elementwise/fast_topk.py
++++ b/python/sglang/kernels/ops/elementwise/fast_topk.py
+@@ -1,38 +1,17 @@
+ from __future__ import annotations
+ 
+-from typing import TYPE_CHECKING, Optional
++from typing import Optional
+ 
+ import torch
+ 
+-from sglang.kernels.jit.utils import (
+-    cache_once,
+-    is_arch_support_pdl,
+-    load_jit,
+-    make_cpp_args,
+-)
+-
+-if TYPE_CHECKING:
+-    from tvm_ffi.module import Module
+-
+ _FAST_TOPK_SUPPORTED_K = (512, 2048)
+ 
+ 
+-@cache_once
+-def _jit_fast_topk_module(topk: int) -> Module:
+-    """Compile and cache the JIT fast top-k module for a given k."""
+-    # Checks on the compile key live here, not in `fast_topk`: `cache_once`
+-    # keys on `topk`, so this runs once per specialisation.
++def _check_topk(topk: int) -> None:
+     if topk not in _FAST_TOPK_SUPPORTED_K:
+         raise RuntimeError(
+             f"Unsupported topk {topk}. Supported: {_FAST_TOPK_SUPPORTED_K}"
+         )
+-    args = make_cpp_args(topk, is_arch_support_pdl())
+-    return load_jit(
+-        "fast_topk",
+-        *args,
+-        cuda_files=["elementwise/fast_topk.cuh"],
+-        cuda_wrappers=[("fast_topk", f"FastTopKKernel<{args}>::run")],
+-    )
+ 
+ 
+ def fast_topk(
+@@ -47,7 +26,7 @@ def fast_topk(
+     Row b selects the `topk` largest values in
+     ``score[b, row_starts[b] : row_starts[b] + lengths[b]]`` and returns their
+     indices relative to ``row_starts[b]``. Slots beyond ``lengths[b]`` are -1.
+-    Output order within a row is unspecified (atomic collection order).
++    Output order is deterministic for fixed inputs but otherwise unspecified.
+ 
+     Parameters
+     ----------
+@@ -60,11 +39,20 @@ def fast_topk(
+     -------
+     CUDA int32 tensor [B, topk]
+     """
++    _check_topk(topk)
+     batch = score.shape[0]
+-    if row_starts is None:
+-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
+-    indices = score.new_empty((batch, topk), dtype=torch.int32)
+-
+-    module = _jit_fast_topk_module(topk)
+-    module.fast_topk(score, row_starts, indices, lengths)
+-    return indices
++    offsets = torch.zeros(batch, dtype=torch.int32, device=score.device)
++    starts = None
++    if row_starts is not None:
++        starts = row_starts.to(device=score.device, dtype=torch.int32).contiguous()
++
++    from flashinfer import top_k_ragged_transform
++
++    return top_k_ragged_transform(
++        score.contiguous(),
++        offsets,
++        lengths.to(device=score.device, dtype=torch.int32).contiguous(),
++        topk,
++        deterministic=True,
++        row_starts=starts,
++    )
+diff --git a/python/sglang/srt/layers/attention/qsa/kernel.py b/python/sglang/srt/layers/attention/qsa/kernel.py
+index 3fc6d2216..747207e3b 100644
+--- a/python/sglang/srt/layers/attention/qsa/kernel.py
++++ b/python/sglang/srt/layers/attention/qsa/kernel.py
+@@ -26,34 +26,14 @@ def qsa_fast_topk(
+     row_ends: torch.Tensor,
+     topk: int,
+ ) -> torch.Tensor:
+-    """Select compressed blocks, with a compatibility fallback for top-k 512."""
++    """Select compressed blocks with the capacity-safe ragged top-k path."""
+ 
+     lengths = (row_ends - row_starts).to(device=logits.device, dtype=torch.int32)
+     starts = row_starts.to(device=logits.device, dtype=torch.int32)
+     if logits.is_cuda:
+-        if topk == 512:
+-            # Prefer the JIT kernel: it ships with the sglang python package,
+-            # so top-k 512 works regardless of the installed sgl_kernel version.
+-            from sglang.kernels.ops.elementwise.fast_topk import fast_topk
++        from sglang.kernels.ops.elementwise.fast_topk import fast_topk
+ 
+-            return fast_topk(logits, lengths, topk=512, row_starts=starts)
+-
+-        from sgl_kernel import top_k as top_k_module
+-
+-        supported_topk = getattr(top_k_module, "_FAST_TOPK_SUPPORTED_K", (2048,))
+-        if topk in supported_topk:
+-            return top_k_module.fast_topk_v2(
+-                logits, lengths, topk=topk, row_starts=starts
+-            )
+-        if topk != 512 or 2048 not in supported_topk:
+-            raise ValueError(
+-                f"QSA top-k {topk} is unsupported by sgl_kernel; "
+-                f"supported values are {supported_topk}"
+-            )
+-        candidates = top_k_module.fast_topk_v2(
+-            logits, lengths, topk=2048, row_starts=starts
+-        )
+-        return _rerank_qsa_topk_candidates(logits, candidates, starts, topk)
++        return fast_topk(logits, lengths, topk=topk, row_starts=starts)
+ 
+     # CPU/reference path mirrors the CUDA operator's fixed-width, relative output.
+     output = torch.full(
+diff --git a/python/sglang/srt/layers/attention/qsa/mqa.py b/python/sglang/srt/layers/attention/qsa/mqa.py
+index 02719934d..5b028aed9 100644
+--- a/python/sglang/srt/layers/attention/qsa/mqa.py
++++ b/python/sglang/srt/layers/attention/qsa/mqa.py
+@@ -126,7 +126,12 @@ if HAS_TILELANG:
+         block_q: int = 32,
+         num_stages: int = 3,
+         threads: int = 512,
++        split: int = 1,
+     ):
++        # Split-K over key tiles: row_blocks x split CTAs cover disjoint
++        # tile ranges of the block's [start_min, end_max] window.  Without
++        # it, a 128-row late-chunk iteration launches only 4 CTAs and idles
++        # the GPU (measured 1.6 TF/s vs 91 TF/s at split=64, 2026-09-11).
+         rows = T.dynamic("rows")
+         keys = T.dynamic("keys")
+ 
+@@ -138,7 +143,9 @@ if HAS_TILELANG:
+             Starts: T.Tensor([rows], T.int32),  # type: ignore
+             Ends: T.Tensor([rows], T.int32),  # type: ignore
+         ):
+-            with T.Kernel(T.ceildiv(rows, block_q), threads=threads) as bx:
++            with T.Kernel(
++                T.ceildiv(rows, block_q), split, threads=threads
++            ) as (bx, by):
+                 q_shared = T.alloc_shared([block_q * heads, head_dim], T.bfloat16)
+                 k_shared = T.alloc_shared([block_n, head_dim], T.bfloat16)
+                 scores = T.alloc_fragment([block_n, block_q * heads], T.float32)
+@@ -147,32 +154,44 @@ if HAS_TILELANG:
+                 row_base = bx * block_q
+                 start_min = T.alloc_var(T.int32)
+                 end_max = T.alloc_var(T.int32)
++                tiles = T.alloc_var(T.int32)
++                lo_t = T.alloc_var(T.int32)
++                hi_t = T.alloc_var(T.int32)
+                 start_min = 2147483647
+                 end_max = -2147483648
+                 for qi in T.serial(block_q):
+                     start_min = T.min(start_min, T.min(Starts[row_base + qi], keys))
+                     end_max = T.max(end_max, T.min(Ends[row_base + qi], keys))
+-
+-                T.copy(Q[row_base * heads, 0], q_shared)
+-                for ni in T.Pipelined(
+-                    T.ceildiv(end_max - start_min, block_n), num_stages=num_stages
+-                ):
+-                    T.copy(K[start_min + ni * block_n, 0], k_shared)
+-                    T.gemm(
+-                        k_shared,
+-                        q_shared,
+-                        scores,
+-                        transpose_B=True,
+-                        clear_accum=True,
+-                        policy=T.GemmWarpPolicy.FullCol,
+-                    )
+-                    for n, qi, head in T.Parallel(block_n, block_q, heads):
+-                        scores_3d[n, qi, head] = T.max(scores_3d[n, qi, head], 0.0)
+-                    T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
+-                    for qi, n in T.Parallel(block_q, block_n):
+-                        Logits[row_base + qi, start_min + ni * block_n + n] = reduced[
+-                            n, qi
+-                        ]
++                # Tail tile may read K rows past end_max (within pool keys);
++                # its out-of-window logits columns are scrubbed by the mask
++                # kernel downstream, exactly like the split=1 tail tile does.
++                tiles = T.ceildiv(end_max - start_min, block_n)
++                lo_t = tiles * by // split
++                hi_t = tiles * (by + 1) // split
++                if lo_t < hi_t:
++                    T.copy(Q[row_base * heads, 0], q_shared)
++                    for ni in T.Pipelined(
++                        hi_t - lo_t, num_stages=num_stages
++                    ):
++                        T.copy(K[start_min + (lo_t + ni) * block_n, 0], k_shared)
++                        T.gemm(
++                            k_shared,
++                            q_shared,
++                            scores,
++                            transpose_B=True,
++                            clear_accum=True,
++                            policy=T.GemmWarpPolicy.FullCol,
++                        )
++                        for n, qi, head in T.Parallel(block_n, block_q, heads):
++                            scores_3d[n, qi, head] = T.max(
++                                scores_3d[n, qi, head], 0.0
++                            )
++                        T.reduce_sum(scores_3d, reduced, dim=-1, clear=True)
++                        for qi, n in T.Parallel(block_q, block_n):
++                            Logits[
++                                row_base + qi,
++                                start_min + (lo_t + ni) * block_n + n,
++                            ] = reduced[n, qi]
+ 
+         return kernel
+ 
+@@ -314,7 +333,13 @@ def tilelang_qsa_mqa_prefill(
+         starts = torch.cat([starts, starts[-1:].expand(padding)])
+         ends = torch.cat([ends, ends[-1:].expand(padding)])
+ 
+-    _tilelang_qsa_mqa_prefill_kernel(heads=heads, head_dim=head_dim, block_q=block_q)(
++    # Split-K fixed at 64 (measured sweet spot: 91 TF/s at late depth; 2026-09-11).
++    # No host-side span math: an .item() sync here would invalidate any future
++    # prefill CUDA graph capture.  CTAs whose tile range comes out empty exit
++    # immediately, so short windows pay only negligible launch overhead.
++    _tilelang_qsa_mqa_prefill_kernel(
++        heads=heads, head_dim=head_dim, block_q=block_q, split=64
++    )(
+         q_padded.reshape(-1, head_dim),
+         k[:, 0].to(torch.bfloat16).contiguous(),
+         logits,
+diff --git a/python/sglang/srt/layers/moe/topk.py b/python/sglang/srt/layers/moe/topk.py
+index 0ba57ec77..a2aac907f 100644
+--- a/python/sglang/srt/layers/moe/topk.py
++++ b/python/sglang/srt/layers/moe/topk.py
+@@ -2197,6 +2197,17 @@ def select_experts(
+         info=expert_location_dispatch_info,
+     )
+ 
++    # expert-cold-pool-v2: runtime expert keep-mask/cold-pool (see layers/moe/expert_cold_pool.py)
++    from sglang.srt.layers.moe import expert_cold_pool as _ecp
++
++    _pre_mask_logits = None
++    # v2.9 IDENTITY gate: keep the layer_id, but only act when this caller's
++    # TopKConfig was registered by the shrink — MTP draft layers reuse
++    # decoder layer_id 0..47 inside the same process and must stay untouched.
++    _cp_lid = _ecp.is_managed_config(topk_config) if layer_id is not None else None
++    if _cp_lid is not None:
++        router_logits, _pre_mask_logits = _ecp.apply_keep_mask(_cp_lid, router_logits)
++
+     # DeepSeek V2/V3/R1 series models use grouped_top_k
+     # remove num_fused_shared_experts from grouped_topk/biased_grouped_topk
+     num_routed_topk = top_k - num_fused_shared_experts
+@@ -2384,12 +2395,21 @@ def select_experts(
+         expert_location_dispatch_info=expert_location_dispatch_info,
+     )
+ 
++    # expert-cold-pool-v2: demand stash + global->slot remap (see layers/moe/expert_cold_pool.py)
++    if _cp_lid is not None:
++        _k = topk_ids.shape[-1] if topk_ids.dim() > 1 else 1
++        _ecp.stash_demand(_cp_lid, _pre_mask_logits, recorder_topk_ids, _k)
++        topk_ids = _ecp.remap_topk_ids(_cp_lid, topk_ids)
++
+     get_global_expert_distribution_recorder().on_select_experts(
+         topk_ids=recorder_topk_ids
+     )
+ 
+     # ===== TO BE REFACTORED ====
+     if packed_topk is not None:
++        # expert-cold-pool-v2: packed ids carry global expert ids in the high 16 bits
++        if _cp_lid is not None:
++            packed_topk = _ecp.remap_packed_ids(_cp_lid, packed_topk)
+         return StandardTopKOutputPacked(
+             topk_weights, topk_ids, router_logits, packed_topk
+         )
+diff --git a/python/sglang/srt/mem_cache/kv_cache_configurator.py b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+index 69df49c56..f9e8a1c46 100644
+--- a/python/sglang/srt/mem_cache/kv_cache_configurator.py
++++ b/python/sglang/srt/mem_cache/kv_cache_configurator.py
+@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Any, Optional
+ import msgspec
+ import torch
+ 
++import gc
++
+ from sglang.srt.arg_groups.overrides import resolving_view
+ from sglang.srt.configs.hybrid_arch import (
+     hybrid_gdn_config,
+@@ -1871,6 +1873,7 @@ class KVCacheConfigurator:
+         # KV pool budget = currently-free GPU memory minus the non-static runtime
+         # slack (pre_model_load_memory * (1 - mem_fraction_static)). Whatever is
+         # already resident (model weights, etc.) is thus charged against it.
++        gc.collect()
+         available_gpu_memory = get_available_gpu_memory(
+             self.device,
+             self.gpu_id,
+@@ -2141,7 +2144,10 @@ class KVCacheConfigurator:
+             # Reserve intermediate memory based on capped max_num_reqs (+1: the
+             # pool's padding slot, see memory_pool.py). Skipped under replayssm
+             # (no intermediate_ssm allocated).
+-            if has_spec_dec and not replayssm_active:
++            if has_spec_dec and not (
++                replayssm_active
++                or get_exec().mamba.gdn_mtp_cache_mode == "none"
++            ):
+                 ratio = self._calculate_mamba_ratio()
+                 capped_reqs = min(
+                     get_schedule().max_running_requests // self.ps.attn_dp_size,
+@@ -2165,7 +2171,10 @@ class KVCacheConfigurator:
+             )
+             # Reserve intermediate memory based on capped max_num_reqs (+1: the
+             # pool's padding slot). Skipped under replayssm.
+-            if has_spec_dec and not replayssm_active:
++            if has_spec_dec and not (
++                replayssm_active
++                or get_exec().mamba.gdn_mtp_cache_mode == "none"
++            ):
+                 intermediate_size = (
+                     stage_per_req
+                     * (get_schedule().max_mamba_cache_size + 1)
+@@ -2187,7 +2196,10 @@ class KVCacheConfigurator:
+             )
+             mamba_budget_bytes = mamba_budget * (1 << 30)
+ 
+-            if has_spec_dec and not replayssm_active:
++            if has_spec_dec and not (
++                replayssm_active
++                or get_exec().mamba.gdn_mtp_cache_mode == "none"
++            ):
+                 ratio = self._calculate_mamba_ratio()
+                 D = get_spec().speculative_num_draft_tokens
+                 # Joint solve: main_state + intermediate = mamba_budget
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index 7f0d9e9ef..ae24476cb 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -829,6 +829,11 @@ class ModelRunner:
+             self.memory_pool_config = memory_pool_config
+ 
+         self.init_kv_cache_configurator()
++        # gcfix (ported from AntigravityAI L5): break reference cycles left by
++        # weight loading so transient allocations do not pollute pool pricing.
++        import gc as _gc
++        _n = _gc.collect()
++        logger.info("gcfix: collected %d objects before pool pricing", _n)
+         result = self.kv_cache_configurator.configure(
+             pre_model_load_memory=self.pre_model_load_memory
+         )
+@@ -1158,6 +1163,13 @@ class ModelRunner:
+             )
+         self.loader = loaded.loader
+         self.model = loaded.model
++        # expert-cold-pool-v2: cold-pool shrink strictly AFTER process_weights_after_loading;
++        # draft workers never shrink (their unquant FusedMoE layer_id can
++        # collide with keep-mask keys)
++        from sglang.srt.layers.moe import expert_cold_pool as _ecp
++
++        if not self.is_draft_worker:
++            _ecp.maybe_shrink_after_process(self.model)
+         self.startup_weight_load = loaded.startup_weight_load
+         if loaded.remote_instance_weight_info is not None:
+             self.remote_instance_weight_transporter.weight_info = (
+@@ -1645,6 +1657,11 @@ class ModelRunner:
+         if get_exec().moe.elastic_ep_backend is not None:
+             self.maybe_join_ep_ranks()
+ 
++        # expert-cold-pool-v2: dynamic expert staging, strictly outside graph replay
++        from sglang.srt.layers.moe import expert_cold_pool as _ecp
++
++        _ecp.after_forward_hook()
++
+         return output
+ 
+     def _maybe_execute_deferred_mamba_cow_and_clear(
+diff --git a/python/sglang/srt/speculative/eagle_worker_v2.py b/python/sglang/srt/speculative/eagle_worker_v2.py
+index 90ee3cc1a..2247a139b 100644
+--- a/python/sglang/srt/speculative/eagle_worker_v2.py
++++ b/python/sglang/srt/speculative/eagle_worker_v2.py
+@@ -107,6 +107,7 @@ from sglang.srt.utils.common import (
+     empty_context,
+     fast_topk,
+     get_available_gpu_memory,
++    get_bool_env_var,
+     is_cpu,
+     is_cuda,
+     is_hip,
+@@ -215,6 +216,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+         token_to_kv_pool_allocator=None,
+     ):
+         """Allocate draft KV cache pools (called by scheduler)."""
++        self._embed_head_shared = False
++        if get_bool_env_var("SGLANG_NEXTN_EARLY_SHARE"):
++            self._early_share_target_embed_and_head()
++            # poolfix-at-release: the dropped draft embed/lm_head clones can sit
++            # in reference cycles; collect before any pool pricing snapshots.
++            torch.cuda.synchronize()
++            import gc as _gc
++            _n = _gc.collect()
++            logger.info("early-share post-release gc: %d objects collected", _n)
+         self.req_to_token_pool = req_to_token_pool
+         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+         self.draft_worker.alloc_memory_pool(
+@@ -281,6 +291,31 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+             self.index_share_for_mtp_iteration and self.dsa_index_topk is not None
+         )
+ 
++    def _early_share_target_embed_and_head(self):
++        """NEXTN: alias draft embed/lm_head onto target's tensors before pool
++        sizing (ported from AntigravityAI A.4). EAGLE3 skipped; init_lm_head
++        rebinding later becomes a guarded no-op."""
++        if self.speculative_algorithm.is_eagle3():
++            return
++        draft_model = self.draft_runner.model
++        if not hasattr(draft_model, "set_embed_and_head"):
++            logger.warning(
++                "SGLANG_NEXTN_EARLY_SHARE=1 but draft model %s has no "
++                "set_embed_and_head; falling back to post-pricing sharing.",
++                type(draft_model).__name__,
++            )
++            return
++        embed, head = self.target_worker.model_runner.model.get_embed_and_head()
++        if embed is None or head is None:
++            return
++        draft_model.set_embed_and_head(embed, head)
++        self._embed_head_shared = True
++        logger.info(
++            "NEXTN early embed/head sharing done before KV pool sizing "
++            "(draft %s now aliases target tensors).",
++            type(draft_model).__name__,
++        )
++
+     def init_token_map(self):
+         # Load hot token ids
+         if self.speculative_algorithm.is_eagle3():
+@@ -345,8 +380,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
+                     head = head.clone()
+                     head.data = head.data[self.hot_token_id]
+ 
+-            # Share the embedding and lm_head
+-            self.draft_runner.model.set_embed_and_head(embed, head)
++            # Share the embedding and lm_head. With SGLANG_NEXTN_EARLY_SHARE=1
++            # the same alias was bound before pool sizing; rebind here is a
++            # no-op worth skipping so the free stays accounted once.
++            # FR-Spec caveat (A.4): when hot_token_id is set the rebind applies
++            # the hot-token head slice, so it must NOT be skipped.
++            if not (
++                getattr(self, "_embed_head_shared", False)
++                and getattr(self, "hot_token_id", None) is None
++            ):
++                self.draft_runner.model.set_embed_and_head(embed, head)
++                self._embed_head_shared = True
+             maybe_share_target_lm_head()
+ 
+     def init_attention_backend(self):

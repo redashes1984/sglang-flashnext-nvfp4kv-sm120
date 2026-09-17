@@ -8,7 +8,7 @@
 
 前作基础：[jpezzulli/sglang-rtxpro6000](https://github.com/jpezzulli/sglang-rtxpro6000) 与 [gabrielolympie/sglang-flashnext-sm120](https://github.com/gabrielolympie/sglang-flashnext-sm120) —— 两家都是 fp8-KV；**本仓库补上的是他们没有的 nvfp4-KV 数据点**。
 
-## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版 → 专家冷池 → 第五轮定档 → 第六轮 fp8kv-1M → 第七轮 nvfp4kv-1M 定档 → 第八轮 top-k 路由 → 第九轮 fp8kv 迁 CT113 + estfix）
+## 成果（栈的代际：基准 → 二次调优 → nvfp4kv-1m 试验版 → 专家冷池 → 第五轮定档 → 第六轮 fp8kv-1M → 第七轮 nvfp4kv-1M 定档 → 第八轮 top-k 路由 → 第九轮 fp8kv 迁 CT113 + estfix → 第十轮 CT110 pennyroyal-v2.5.1：gcfix + MXFP8 + 冷池 keep330+64 + cache-report）
 
 | | fp8kv 方案 | nvfp4kv 基准版 | nvfp4kv 二次调优版 | nvfp4kv-1m 试验版（第三轮） | 定档栈（第四轮冷池 + 第五轮缓存修复） | **fp8kv-1M + split-K（第六轮）** | **nvfp4kv-1M 定档（第七轮，现役）** |
 |---|---|---|---|---|---|---|---|
@@ -157,6 +157,21 @@ nvfp4 KV 路径的质量门禁全绿：NIAH 200K、6×107K 并发池压下的 ne
 **测试资产 rebase 漂移修复**：`scripts/test_ckpt_ple_patch.py` T6 在新树上假 FAIL——`mamba_checkpoint_pool` 用 `from sglang.srt.runtime_context import get_exec` 模块级绑定，测试只 patch `rc.get_exec` 打不中 → 工厂看到真 get_exec 返回 None。修复：消费模块名也 patch（`mcp.get_exec`），finally 成对还原。属测试资产漂移，非产品代码问题。
 
 **复验电池（当日维护窗，09-15）与最终定档 = 退回 1,651,520**：空卡 gateA2 全格 bitwise 9 格绿（1 例 tilelang 编译 EXC + ref lane 零案例，属脚本对 CT113 树适配问题，另行定罪，非 split-K 腐化）；CPU T1–T11（冷池，repo 补丁版 md5==现役 overlay）与 T1–T6（ckpt-ple，漂移修复后）全绿。但 **B 案 1,771,520 两次死于 1M shape 验收**（09:18 与 09:39 同构：scheduler OOM 48 MB → SIGQUIT）——warmup 缴税后探针实测 **post-settle free 仅 1.25 GB**，1M 冷灌的行块暂存（~1.5GB 级）放不进去。10:35 棣民拍板**退回 09-11 定档值 1,651,520**：boot fence 5.12、settle 后 2.86 GiB（vs 09-11 的 4.00 账面——差值即本轮实测的 late-load 税 ~1.2-2.3 GB 在新树上的真身），warmup "late-load window closed"。**回退后 shape 探针当场全绿（10:36–10:44）**：1M 冷灌 129.3s（pt=1,000,976，比 09-11 的 133s 还快）、NIAH@1M 三针全中 PASS、重问 1.7s 全命中（cached=1,000,976）、2×256K 侧链 27.1/27.3s + 重问 0.4–0.5s、1.56M 驻留下小请求 ×4 4.12–4.21s（⚠️ 比第六轮 0.66–0.81s 慢 ~5×，观察项：94.6% 满池 + bs8 图批下的侧翼延迟，非阻断）。**结论加粗：+120K 的代价不是 1.6GB fence，是 1M 形态本身——钉池扩容的钱要从 shape 预算里出，fence 3.52 是纸面富贵。** estfix 保留（防静默降池雷与池值无关）。回滚锚：`/opt/sglang-config/dealignai-qwen4exp-fp8kv.yaml.bak-pool-20260915`（池值）、`kv_cache_configurator.py.bak-estfix-20260915`（源码）。
+
+## 第十轮（2026-09-17）：CT110 pennyroyal-v2.5.1 现役 —— gcfix + 在线 MXFP8 + 冷池 keep330+64 + cache-report
+
+**背景**：CT110 跑的是 pennyroyal fork 血统（`ghcr.io/jpezzulli/sglang-rtxpro6000`，editable 安装在 `/opt/pennyroyal`，unit `sglang-dealignai-fp8kv-hicache.service`，端口 8000）。fast-forward 到 tag `pennyroyal-v2.5.1`（quoted tool-marker 解析修复、checkpoint donation 压力策略、QSA chunked-prefill 非对齐前缀修复、C6 档），七处本地 overlay 改动经 autostash 零冲突回贴。overlay diff 存档于 `patches/pennyroyal-v2.5.1-overlay.diff`，冷池模块 `patches/expert_cold_pool.py`（md5 `6d17690934bfcfb1587f2db88b52141f`）。
+
+**gcfix（修正第九轮结论）**：CT113 树里 `_profile_available_bytes` 自带 `gc.collect()`，但 pennyroyal CT110 树**没有**——只 `empty_cache`，导致 profiled KV 池在同硬件上逐次抖动（实测 368,576 ↔ 451,776）。在 availability 读数前补一次 `gc.collect()` 后稳定在 451,776。可推广的教训：第九轮"gcfix 上游已有"是**树相关的**——先 grep 现役树再下结论。回滚锚 `kv_cache_configurator.py.bak-gcfix-20260917`。
+
+**在线 MXFP8**（`Environment=SGLANG_SM120_ONLINE_MXFP8=true`）：FlashInfer CUTLASS + UE8M0，合格的 BF16 投影在加载期转 fp8；池在 gcfix 之上再升到 **693,056**。journal 签名 `Flash-Next online FP8 enabled on SM120` + 各层 `MXFP8 projection ready`。备份 `.bak-mxfp8-20260917`。
+
+**冷池 keep330+64 补齐 1M**：`SGLANG_EXPERT_KEEP_MASK=config/expert_keep_330_final.json` + `KEEP_OFFLOAD=1` + `COLD_POOL_SLOTS=64`，shrink 把 ~24.15 GB 专家权重挪进 pinned host，FP8 KV 池顶满 YAML 钉值 **1,572,864**（journal `#tokens: 1572864`），对比无冷池时的 693,056。HiCache host 侧 827,008 tok / 11.01 GB。staging 循环实测活跃：`calls=64 strong=82077 staged=611 evicted=0 h2d=1.69GB`，零 MISMATCH/stage_fail。注意 journal 新的不对称提示：host 池(827K) < device 池(1.57M)，L2 覆盖约 53%——长会话复问变慢就抬 `hicache-ratio`。
+
+**质量门**：188K 双针召回全中（`Yunling City / AZURE-9182`）、短对话 PIN 通过、TTFT 224–240 ms、cold decode ≈109 tok/s / hot ≈92–97。keep-mask 压平路由分布、长思考链易滑向填充循环（hmm hmm）的观察依旧——keep 保持 320+/512，砍太狠在 CT114 已被语义验收证伪。
+
+**cache-report**：YAML 加 `enable-cache-report: true` 后响应带 `usage.prompt_tokens_details.cached_tokens`（命中率 = cached/prompt）。前端解析两个事实：cached==0 时整个 details 对象省略（判 `null` 不是 `{}`）；计数按 `page_size: 64` 页对齐，短 prompt 报不满属正常。
+
 
 ## fp8kv 方案（第六轮验证栈 · 第九轮起在 CT113 现役，nvfp4kv 退为兜底）
 
